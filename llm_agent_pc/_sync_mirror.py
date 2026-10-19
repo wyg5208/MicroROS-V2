@@ -7,6 +7,8 @@
       python C:\\microros-agent\\_sync_mirror.py --check  # 只报告，不写盘
       python C:\\microros-agent\\_sync_mirror.py --prune   # 再清掉离线包里多出来的语音文件
 搬完逐个比 md5；对不上就非零退出，绝不把"cp 没报错"当成同步成功。
+**目标是新的就不搬**（比源新 = 镜像那一侧有人撰稿过，见 job() 里的事故说明）：报"冲突"、跳过它、
+退出码非零，让人先决定往哪个方向合。要复测这个门：`python _sync_conflict_test.py`（全离线）。
 """
 import hashlib
 import os
@@ -30,7 +32,7 @@ OVERRIDE = {
 }
 TOP = ["agent.py", "car_chat.py", "car_chat_ui.html", "_speak.ps1", "_voice_test.py",
        "_asr_audit.py", "_relaunch_chat.ps1", "启动智能体.bat", "启动聊天页面.bat",
-       "_sync_mirror.py"]
+       "_sync_mirror.py", "_sync_conflict_test.py"]
 def md5(path):
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -42,8 +44,18 @@ def md5(path):
 def job(src, dst):
     if not os.path.isfile(src):
         return ("缺源", src)
-    if os.path.isfile(dst) and md5(src) == md5(dst):
-        return ("已一致", dst)
+    if os.path.isfile(dst):
+        if md5(src) == md5(dst):
+            return ("已一致", dst)
+        # 2026-10-19 实测踩过：《用户操作手册.md》的编辑只写在 G: 那一侧，这一句把它静默盖回了 HEAD，
+        # 73 行新内容没了、git status 里连痕迹都不留（因为它"同步成功"了）。copy2 会把源的 mtime
+        # 带到目标，所以真同步过的文件两边 mtime 相同 —— **目标比源新**只可能是有人在镜像那侧动了笔，
+        # 那不是"源落后"，是要人判断的冲突。宁可报冲突不搬，也不能搬掉别人的撰稿。
+        try:
+            if os.path.getmtime(dst) > os.path.getmtime(src) + 1.0:
+                return ("冲突", dst)
+        except OSError:
+            pass
     return ("要搬", "%s -> %s" % (src, dst))
 
 
@@ -123,18 +135,22 @@ def main(check_only):
         moves.append((os.path.join(SRC, "asr", "bin", "Release", name),
                       os.path.join(MIRROR_OFF, "asr", "bin", "Release", name)))
 
-    todo, skip, miss = [], 0, []
+    todo, skip, miss, conf = [], 0, [], []
     for s, d in moves:
         st, info = job(s, d)
         if st == "要搬":
             todo.append((s, d))
         elif st == "已一致":
             skip += 1
+        elif st == "冲突":
+            conf.append(info)
         else:
             miss.append(info)
-    print("待搬 %d，已一致 %d，找不到源 %d" % (len(todo), skip, len(miss)))
+    print("待搬 %d，已一致 %d，找不到源 %d，目标更新（不搬）%d" % (len(todo), skip, len(miss), len(conf)))
     for m in miss:
         print("  缺源：%s" % m)
+    for c in conf:
+        print("  冲突：%s 比它的源新 —— 先在 C:\\microros-agent 里核对/拷回，再同步，**这次没有覆盖它**" % c)
     strays = extra_files(moves)
     for p in strays:
         print("  多出来的（不在交付清单里）：%s %.1f MB" % (
@@ -142,7 +158,7 @@ def main(check_only):
     if check_only:
         for s, d in todo:
             print("  要搬：%s -> %s" % (s, d))
-        return 0
+        return 1 if conf else 0
     bad = []
     for s, d in todo:
         os.makedirs(os.path.dirname(d), exist_ok=True)
@@ -159,7 +175,7 @@ def main(check_only):
             if not os.listdir(root):
                 os.rmdir(root)
         print("清掉 %d 个多出来的文件" % len(strays))
-    return 1 if bad else 0
+    return 1 if (bad or conf) else 0
 
 
 if __name__ == "__main__":

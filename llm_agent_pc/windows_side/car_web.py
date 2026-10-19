@@ -484,8 +484,16 @@ class Console:
         w_act = b["yaw"] / dt
         self._add_sample(b["v"], b["w"], v_act, w_act, dt, "teleop")
         if abs(b["v"]) > 0.02 or abs(b["w"]) > 0.05:
-            self.push("点动 %.1f s：指令 v=%.2f w=%.2f → 实测 v=%.3f w=%.3f"
-                      % (dt, b["v"], b["w"], v_act, w_act), "meas")
+            # Below FIT_MIN_DT this average is dominated by the ramp the board accelerates into
+            # (it holds 0.2-0.3 s of queued twist), so it is not a rate the chassis ever holds.
+            # The number has to say that on its own line: a 2.19 s / w=-0.30 burst printed as
+            # "实测 -0.023" reads like a 13x failure, while the same command over 6 s gives
+            # -0.22 -- and the fit already drops the short one, so the log was the only place
+            # where the short sample looked like a fault.
+            self.push("点动 %.1f s：指令 v=%.2f w=%.2f → 实测 v=%.3f w=%.3f%s"
+                      % (dt, b["v"], b["w"], v_act, w_act,
+                         "" if dt >= FIT_MIN_DT else
+                         "（短脉冲：整段都在起步爬升里，不是稳态速率，拟合不收）"), "meas")
 
     # ------------------------------------------------------------- mapping ----
     def add_calib_sample(self, c):
