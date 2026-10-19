@@ -1245,6 +1245,12 @@ class Console:
         with self.lock:
             self.world = nav.World()
             self.trail.clear()
+            # Clearing is only ever done to start a new map, and the blank grid is anchored on
+            # the raw odometry it is about to be folded with -- so it must also switch folding
+            # back on. It used not to: after the machine froze mapping for a bad relocation,
+            # 清空地图 wiped the good grid and then quietly drew nothing, while the log line
+            # below promised "重新开始建图".
+            self.mapping = True
             self.reloc.update(frozen=False, agree=None, best=None, cand=[], trial=None)
         self.watch_hist.clear()
         self.watch_bad = 0
