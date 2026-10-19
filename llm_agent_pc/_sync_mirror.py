@@ -32,7 +32,8 @@ OVERRIDE = {
 }
 TOP = ["agent.py", "car_chat.py", "car_chat_ui.html", "_speak.ps1", "_voice_test.py",
        "_asr_audit.py", "_relaunch_chat.ps1", "启动智能体.bat", "启动聊天页面.bat",
-       "_sync_mirror.py", "_sync_conflict_test.py"]
+       "_sync_mirror.py", "_sync_conflict_test.py",
+       "car_cron.py", "cron_tasks.json", "安装定时任务.bat", "卸载定时任务.bat"]
 def md5(path):
     h = hashlib.md5()
     with open(path, "rb") as f:
