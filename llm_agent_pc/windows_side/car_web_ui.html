@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>MicroROS-V2 控制台</title>
+<style>
+:root{--bg:#14171c;--pan:#1c2128;--ed:#2b323c;--fg:#dfe3e8;--dim:#8b95a3;--acc:#4aa3ff;--ok:#3fbf7f;--warn:#e0a63c;--bad:#e05252}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 "Segoe UI",system-ui,sans-serif}
+h1{font-size:15px;margin:0}
+h2{font-size:12px;margin:0 0 8px;color:var(--dim);font-weight:600;letter-spacing:.04em}
+.wrap{display:grid;grid-template-columns:300px 1fr 340px;gap:10px;padding:10px;align-items:start}
+.pan{background:var(--pan);border:1px solid var(--ed);border-radius:8px;padding:10px}
+.row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+button{background:var(--ed);color:var(--fg);border:1px solid #3a424e;border-radius:6px;
+  padding:6px 10px;font:inherit;cursor:pointer}
+button:hover{background:#39414d}
+button:active{transform:translateY(1px)}
+button.on{background:var(--acc);border-color:var(--acc);color:#08101a}
+.stop{background:var(--bad);border-color:#ff6b6b;color:#fff;font-weight:700;padding:10px 14px;font-size:15px}
+canvas{background:#0b0d10;border:1px solid var(--ed);border-radius:6px;display:block;width:100%}
+input[type=range]{width:100%}
+input[type=number],input[type=text]{background:#0f1216;color:var(--fg);border:1px solid var(--ed);
+  border-radius:5px;padding:4px 6px;font:inherit;width:70px}
+input[type=text]{width:100%}
+label{color:var(--dim);font-size:11px}
+.stat{display:grid;grid-template-columns:auto 1fr;gap:2px 8px;font-variant-numeric:tabular-nums}
+.stat b{color:var(--fg);font-weight:600}
+.grid4{display:grid;grid-template-columns:repeat(3,54px);gap:5px;justify-content:center}
+.dpad{font-size:17px;padding:12px 0}
+.log{height:210px;overflow:auto;font:11px/1.45 Consolas,monospace;background:#0f1216;
+  border:1px solid var(--ed);border-radius:6px;padding:6px}
+.log div{border-bottom:1px solid #1a1f26;padding:2px 0;white-space:pre-wrap}
+.log .meas{color:var(--ok)}.log .stop{color:var(--bad)}.log .error{color:var(--warn)}.log .warn{color:var(--warn)}
+.log .tour,.log .map,.log .origin,.log .user{color:var(--acc)}
+video,img{width:100%;border-radius:6px;background:#000;display:block}
+.hint{color:var(--dim);font-size:11px}
+.reloc{display:flex;gap:8px;align-items:center;background:#3a1418;border:1px solid var(--bad);
+  border-radius:6px;padding:8px 10px;margin-bottom:8px;color:#ffd9dc;font-size:12px}
+.reloc[hidden]{display:none}
+.stale{background:#2a2008;border-color:var(--warn);color:#ffe6ad}
+.sp{width:100%}
+@media(max-width:1200px){.wrap{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="pan">
+    <h2>画面 / 雷达</h2>
+    <img id="cam" alt="车摄像头">
+    <div class="row" style="margin-top:6px">
+      <button id="camToggle">视频流</button>
+      <button id="shot">抓一帧</button>
+      <span class="hint" id="camNote"></span>
+    </div>
+    <canvas id="lidar" width="280" height="280" style="margin-top:8px"></canvas>
+    <div class="row" style="margin-top:6px">
+      <label class="sp">雷达显示（正前 ±22° 是云台盲区，画不出东西）</label>
+    </div>
+    <div class="row">
+      <button id="lidarOn" class="on">雷达开</button>
+      <button id="frame">地图同向</button>
+      <span class="hint">最近 <b id="near">-</b> m · 回波 <b id="npts">-</b></span>
+    </div>
+  </div>
+
+  <div class="pan">
+    <h1>MicroROS-V2 控制台 <span class="hint" id="top"></span></h1>
+    <div class="reloc" id="reloc" hidden>
+      <span class="sp" id="relocMsg"></span>
+      <span id="relocCands"></span>
+      <button id="relocGo">恢复建图</button>
+    </div>
+    <div class="reloc stale" id="stale" hidden>
+      <span class="sp" id="staleMsg"></span>
+    </div>
+    <div class="reloc stale" id="lie" hidden>
+      <span class="sp" id="lieMsg"></span>
+    </div>
+    <canvas id="map" width="640" height="640"></canvas>
+    <div class="row" style="margin-top:8px">
+      <button id="mapOn" class="on">实时建图</button>
+      <button id="mapReset">清空地图</button>
+      <button id="lidarOv" class="on">叠加雷达</button>
+      <label>视野 <input type="number" id="half" value="4.0" step="0.5" min="1" max="10"> m</label>
+      <button id="full">全图</button>
+      <button id="axes" class="on">坐标轴</button>
+      <button id="view" class="on">原点居中</button>
+      <button id="tourBtn">跑 Tour 绕行</button>
+    </div>
+    <div class="row" style="margin-top:4px">
+      <label class="sp">地图像素始终画在<b>里程计坐标系</b>里，但刻度数字可以平移：右侧状态栏的<b>把这里设为原点</b>把车此刻的位置标成 (0,0) —— 地图内容一个像素都不动，只有粉色十字和黄色数字跟着搬；<b>真实原点</b>还原到<b>这次上电时车所在的那一点</b>。粉色十字+圆圈 = 原点，粉色直线 = x=0 / y=0，黄色数字 = 米刻度。朝向<b>不</b>随原点旋转，始终是里程计原始航向，所以地图的"上"和数字的 0° 永远一致。默认<b>原点居中</b>（视野自动放大到能同时装下车），点动开车时切<b>车头居中</b>。车重新上电后里程计原点会换地方。</label>
+    </div>
+
+    <div class="row sp" style="margin-top:10px;justify-content:center;gap:24px">
+      <div class="grid4">
+        <span></span><button class="dpad" data-k="fw">↑</button><span></span>
+        <button class="dpad" data-k="ccw">↺</button><button class="dpad" data-k="stop">■</button>
+        <button class="dpad" data-k="cw">↻</button>
+        <span></span><button class="dpad" data-k="bw">↓</button><span></span>
+      </div>
+      <div style="min-width:230px">
+        <label>线速度 <b id="vlab"></b> m/s（上限 <span id="vcap"></span>）</label>
+        <input type="range" id="vsel" min="0.02" max="0.25" step="0.01" value="0.10">
+        <label>角速度 <b id="wlab"></b> rad/s（上限 <span id="wcap"></span>）</label>
+        <input type="range" id="wsel" min="0.05" max="0.9" step="0.01" value="0.30">
+        <div class="row" style="margin-top:6px">
+          <button class="stop" id="estop">急停</button>
+          <span class="hint">键盘 W/A/S/D 或方向键，长按才动，松手即停</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="pan">
+      <h2>状态</h2>
+      <div class="stat">
+        <span>位置</span><b id="pose">-</b>
+        <span>朝向</span><b id="yaw">-</b>
+        <span>里程计</span><b id="oage">-</b>
+        <span>雷达</span><b id="sage">-</b>
+        <span>电池</span><b id="volt">-</b>
+        <span>电机</span><b id="busy">-</b>
+        <span>建图</span><b id="mstat">-</b>
+        <span>雷达↔地图</span><b id="agree">-</b>
+        <span>漂移抑制</span><b id="drift">-</b>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="home">把这里设为原点</button>
+        <button id="homeReset">真实原点</button>
+      </div>
+    </div>
+
+    <div class="pan" style="margin-top:10px">
+      <h2>云台</h2>
+      <div class="row">
+        <button data-ptz="-15,0">←</button><button data-ptz="15,0">→</button>
+        <button data-ptz="0,10">↑</button><button data-ptz="0,-10">↓</button>
+        <button data-ptz="0,0">回正</button>
+        <span class="hint" id="ptz">-</span>
+      </div>
+      <div class="row" style="margin-top:6px"><button id="beep">蜂鸣（找车）</button></div>
+    </div>
+
+    <div class="pan" style="margin-top:10px">
+      <h2>校正</h2>
+      <div class="row">
+        <label>v<input type="number" id="cv" value="0" step="0.02" style="width:60px"></label>
+        <label>w<input type="number" id="cw" value="0.35" step="0.05" style="width:60px"></label>
+        <label>秒<input type="number" id="cs" value="8" step="1" style="width:50px"></label>
+        <button id="runCalib">测一次</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button data-preset="0,0.15,8">左转死区</button>
+        <button data-preset="0,0.35,8">左转中速</button>
+        <button data-preset="0,-0.15,8">右转死区</button>
+        <button data-preset="0,-0.35,8">右转中速</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button data-preset="0.12,0,6">直行</button>
+        <button data-preset="-0.12,0,6">倒退</button>
+        <span class="hint">左右各测满 3 次，拟合才会给左右分别出价</span>
+      </div>
+      <div class="row sp"><button id="fitBtn">从日志拟合控制参数</button>
+        <span class="hint">样本 <b id="nsamp">0</b></span></div>
+      <div id="fit" class="hint" style="margin-top:6px;white-space:pre-wrap"></div>
+      <div class="row" style="margin-top:8px">
+        <label>增益v<input type="number" id="gv" step="0.01" style="width:58px"></label>
+        <label>基准V<input type="number" id="vr" step="0.1" style="width:58px"></label>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label>左增益w<input type="number" id="gw" step="0.01" style="width:58px"></label>
+        <label>左偏置<input type="number" id="wb" step="0.01" style="width:58px"></label>
+        <label>左死区<input type="number" id="wd" step="0.01" style="width:58px"></label>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label>右增益w<input type="number" id="gwn" step="0.01" style="width:58px"></label>
+        <label>右偏置<input type="number" id="wbn" step="0.01" style="width:58px"></label>
+        <label>右死区<input type="number" id="wdn" step="0.01" style="width:58px"></label>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button id="saveGains">保存并生效</button>
+        <span class="hint">写 nav_gains.json，规划器立刻用新参数预测轨迹</span>
+      </div>
+      <div class="row sp" style="margin-top:8px">
+        <label>真实情况：</label><input type="text" id="fb" placeholder="例如：车头其实朝门，左边那堵墙其实 2.1 m">
+        <button id="fbSend">记录反馈</button>
+      </div>
+    </div>
+
+    <div class="pan" style="margin-top:10px">
+      <h2>操作日志</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const api=(p,body)=>fetch(p,body?{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body)}:{}).then(r=>r.json()).catch(e=>({error:''+e}));
+
+// ---- teleop: hold to move, release (or lose the tab) to stop --------------------------
+const held=new Set(); let vs=0.10, ws=0.30, lastSent='';
+const KEYS={KeyW:'fw',ArrowUp:'fw',KeyS:'bw',ArrowDown:'bw',
+            KeyA:'ccw',ArrowLeft:'ccw',KeyD:'cw',ArrowRight:'cw'};
+function target(){
+  let v=0,w=0;
+  if(held.has('fw'))v+=vs; if(held.has('bw'))v-=vs;
+  if(held.has('ccw'))w+=ws; if(held.has('cw'))w-=ws;
+  return [Math.max(-0.25,Math.min(0.25,v)),Math.max(-0.9,Math.min(0.9,w))];
+}
+async function tick(){
+  const [v,w]=target();
+  const sig=v.toFixed(2)+','+w.toFixed(2);
+  if(sig!==lastSent||v||w){ lastSent=sig; await api('/api/teleop',{v:v, w:w, hold:0.35}); }
+}
+setInterval(tick,120);
+addEventListener('keydown',e=>{const k=KEYS[e.code];if(k&&!e.repeat){held.add(k);e.preventDefault();}});
+addEventListener('keyup',e=>{const k=KEYS[e.code];if(k)held.delete(k);});
+addEventListener('blur',()=>held.clear());
+document.addEventListener('visibilitychange',()=>{if(document.hidden)held.clear();});
+document.querySelectorAll('[data-k]').forEach(b=>{
+  const k=b.dataset.k;
+  if(k==='stop'){b.onclick=()=>{held.clear();api('/api/stop',{});};return;}
+  b.onpointerdown=()=>held.add(k); b.onpointerup=()=>held.delete(k);
+  b.onpointerleave=()=>held.delete(k);
+});
+$('estop').onclick=()=>{held.clear();api('/api/stop',{});};
+$('vsel').oninput=e=>{vs=+e.target.value;$('vlab').textContent=vs.toFixed(2);};
+$('wsel').oninput=e=>{ws=+e.target.value;$('wlab').textContent=ws.toFixed(2);};
+
+// ---- status ---------------------------------------------------------------------------
+let st=null, camOn=false, camSeq=0, camUrl='', bodyUp=false;
+async function poll(){
+  st=await api('/api/state'); if(st.error)return;
+  const p=st.pose, moved=st.origin&&(Math.abs(st.origin[0])>1e-6||Math.abs(st.origin[1])>1e-6);
+  $('pose').textContent=p?p[0].toFixed(2)+', '+p[1].toFixed(2)+' m'+
+    (moved?'（原点已移开 '+Math.hypot(st.origin[0],st.origin[1]).toFixed(2)+' m）':''):'无里程计';
+  $('yaw').textContent=p?p[2].toFixed(1)+'°':'-';
+  $('oage').textContent=st.odom_age==null?'-':st.odom_age.toFixed(2)+' s 前';
+  $('sage').textContent=st.scan_age==null?'-':st.scan_age.toFixed(2)+' s 前';
+  $('volt').textContent=st.volts==null?'-':st.volts.toFixed(2)+' V'+(st.volts<10.6?'（偏低）':'');
+  $('busy').textContent=st.busy||(st.teleop.active?'点动中':'空闲');
+  $('mstat').textContent=(st.mapping?'开':'关')+' · '+st.frames+' 帧 · 占据 '+st.occ;
+  const rl=st.reloc||{};
+  const sgn=v=>(v>=0?'+':'')+Number(v).toFixed(2);
+  const hasBias=rl.bias&&(Math.abs(rl.bias[0])>0.005||Math.abs(rl.bias[1])>0.005);
+  $('agree').textContent=rl.agree==null?(rl.why||'未检测')
+    :Math.round(rl.agree*100)+'%'
+     +(hasBias?'（已修正 '+sgn(rl.bias[0])+', '+sgn(rl.bias[1])+' m）':'')
+     +(rl.best>rl.agree+0.25?'，挪一下可到 '+Math.round(rl.best*100)+'%':'');
+  // Only the backend knows whether a residual was trustworthy enough to bank: the gates
+  // (DRIFT_BEST/ZERO/MAX) and the rate cap live there, and this page re-deciding them with its own
+  // copy of the numbers is the mistake the reloc banner already had once.
+  const df=st.drift||{};
+  if(df.why){
+    $('drift').textContent=df.why;
+  }else{
+    const res=df.res||[0,0], est=df.est||[0,0];
+    $('drift').textContent='残差 '+sgn(res[0])+', '+sgn(res[1])
+      +(Math.hypot(est[0],est[1])>0.0015?'（估计 '+sgn(est[0])+', '+sgn(est[1])+'）':'')
+      +(df.n?'，已补 '+df.n+' 次 / '+Number(df.total).toFixed(2)+' m':'，未修正');
+  }
+  $('reloc').hidden=!rl.frozen;
+  if(rl.frozen){
+    // Say *why* the machine stopped short of fixing it itself: "another place fits almost as
+    // well" is the honest answer in a room with parallel walls, and a human with eyes can settle
+    // it in one look -- so show both and let them choose rather than silently guessing.
+    // `ask` comes from the backend: it is the machine saying "I refuse to guess", not this page
+    // re-deciding with its own copy of the threshold (it did once, and offered no way out).
+    const amb=rl.ask;
+    $('relocMsg').textContent='疑似被搬动：里程计说车是静止的，但雷达只和地图对上 '+
+      Math.round(rl.agree*100)+'%；平移 ('+sgn(rl.dx)+', '+sgn(rl.dy)+') m 能对上 '+
+      Math.round(rl.best*100)+'%'+(amb?'，可另一个位置 ('+sgn(rl.rdx)+', '+sgn(rl.rdy)+') m 也有 '+
+      Math.round(rl.rival*100)+'%，机器不敢猜：选一个':'')+'。已急停并暂停建图。';
+    const cs=(rl.cand||[]).filter(c=>c[2]>0.05);
+    $('relocCands').innerHTML=amb?cs.map((c,i)=>'<button data-i="'+i+'">在这 ('+
+      sgn(c[0])+', '+sgn(c[1])+') · '+Math.round(c[2]*100)+'%</button>').join(''):'';
+    $('relocCands')._cand=cs;
+  }
+  // The other way a sweep can disagree with the grid: the grid has walls the lidar is looking
+  // straight through. It needs the opposite response from a carry -- keep folding, which votes the
+  // phantom walls down -- so it gets its own amber row rather than a second sentence in the red
+  // one, and the row has to say out loud that nothing was stopped or frozen.
+  const sv=rl.stale;
+  $('stale').hidden=rl.frozen||!sv;
+  if(!$('stale').hidden){
+    $('staleMsg').textContent='地图这块画错了，不是被搬动：当前位置有 '+Math.round(sv[0]*100)+
+      '% 的回波穿过了图上声称的墙，机器想挪去的位置更糟（'+Math.round(sv[1]*100)+
+      '%）。没改位姿、也没停建图，继续折叠会把这些假墙投票掉。';
+  }
+  // The third way the pose can be a lie: the wheels slipped, so odometry invented part of it.
+  // Two readings from the bridge -- heading the gyro never saw, distance the room behind never
+  // saw recede -- and the fold loop drops those frames, so the row has to say the map skipped
+  // them. Kept on screen 8 s although the hold itself is 1 s: a flash nobody can read is not an
+  // explanation, and this is the human's only notice that a move did not really happen.
+  const ag=(a)=>a&&a[1]<=8.0, lieS=[],
+        l=st.odom_lie, sl=st.odom_slip;
+  if(ag(l)) lieS.push('朝向被打滑的轮子编出来 '+Number(l[0]).toFixed(0)+'°（陀螺没测到）');
+  if(ag(sl)&&sl[0]>0.05) lieS.push('里程计多记了 '+Number(sl[0]).toFixed(2)+
+    ' m（身后的雷达不认）');
+  $('lie').hidden=!lieS.length;
+  if(!$('lie').hidden){
+    $('lieMsg').textContent='轮子打滑：'+lieS.join('，')+
+      '。这段的位姿不可信，建图已跳过它折进来的帧。';
+  }
+  $('nsamp').textContent=st.samples;
+  $('ptz').textContent=st.ptz[0].toFixed(0)+'°, '+st.ptz[1].toFixed(0)+'°';
+  $('top').textContent='· 开机 '+Math.round(st.uptime)+' s';
+  $('vcap').textContent=st.caps.v;$('wcap').textContent=st.caps.w;
+  $('vsel').max=st.caps.v;$('wsel').max=st.caps.w;
+  if(document.activeElement.tagName!=='INPUT'){
+    const g=st.gains;
+    $('gv').value=g.gain_v;$('vr').value=g.volt_ref;
+    $('gw').value=g.gain_w;$('wb').value=g.w_bias;$('wd').value=g.w_dead;
+    $('gwn').value=g.gain_w_neg;$('wbn').value=g.w_bias_neg;$('wdn').value=g.w_dead_neg;
+  }
+  const L=$('log');
+  L.innerHTML=st.log.map(e=>'<div class="'+e.kind+'">['+e.t.toFixed(1)+'s] '+
+      e.text.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+'</div>').join('');
+  if(st.cam&&!camOn&&!camUrl)$('camNote').textContent='图传 '+st.cam;
+}
+setInterval(poll,600);poll();
+
+// ---- map + lidar ----------------------------------------------------------------------
+// Axes, ticks and the origin marker are stamped into the PNG by the server, so every viewer
+// (this page, a phone, a saved file) shows the same coordinates.
+let mapOn=true, ovOn=true, fullView=false, axOn=true, view='odom';
+function drawMap(){
+  if(!mapOn)return;
+  const half=fullView?12:(+$('half').value||4);
+  const im=new Image();
+  im.onload=()=>{const c=$('map');c.width=im.width;c.height=im.height;
+    c.getContext('2d').drawImage(im,0,0);};
+  im.src='/api/map.png?t='+Date.now()+'&half='+half+'&lidar='+(ovOn?1:0)+
+         '&center='+view+'&axes='+(axOn?1:0);
+}
+setInterval(drawMap,900);
+$('mapOn').onclick=e=>{mapOn=!mapOn;e.target.classList.toggle('on',mapOn);
+  api('/api/mapping',{on:mapOn});};
+$('mapReset').onclick=()=>api('/api/mapping',{reset:true});
+$('relocGo').onclick=()=>{mapOn=true;$('mapOn').classList.add('on');api('/api/mapping',{on:true});};
+// One listener on the container: the buttons are rebuilt by every poll, so a per-button handler
+// would be thrown away by the next redraw before the click even landed.
+$('relocCands').onclick=(e)=>{
+  const b=e.target.closest('button');if(!b)return;
+  const c=($('relocCands')._cand||[])[+b.dataset.i];if(!c)return;
+  api('/api/reloc',{dx:c[0],dy:c[1]});
+};
+$('lidarOv').onclick=e=>{ovOn=!ovOn;e.target.classList.toggle('on',ovOn);};
+$('full').onclick=e=>{fullView=!fullView;e.target.classList.toggle('on',fullView);};
+$('home').onclick=()=>api('/api/origin',{});
+$('homeReset').onclick=()=>api('/api/origin',{reset:true});
+$('axes').onclick=e=>{axOn=!axOn;e.target.classList.toggle('on',axOn);};
+$('view').onclick=e=>{view=view==='odom'?'car':'odom';
+  e.target.textContent=view==='odom'?'原点居中':'车头居中';
+  e.target.classList.toggle('on',view==='odom');};
+$('tourBtn').onclick=async e=>{e.target.disabled=true;
+  const r=await api('/api/tour',{seconds:180,out_dir:''});
+  e.target.textContent=r.text||'已启动';setTimeout(()=>e.target.textContent='跑 Tour 绕行',4000);};
+
+let lidarOn=true;
+$('lidarOn').onclick=e=>{lidarOn=!lidarOn;e.target.classList.toggle('on',lidarOn);
+  e.target.textContent=lidarOn?'雷达开':'雷达关';};
+$('frame').onclick=e=>{bodyUp=!bodyUp;e.target.textContent=bodyUp?'车头朝上':'地图同向';};
+async function drawLidar(){
+  if(!lidarOn)return;
+  const s=await api('/api/scan'); const c=$('lidar'), g=c.getContext('2d');
+  g.fillStyle='#0b0d10';g.fillRect(0,0,c.width,c.height);
+  const cx=c.width/2, cy=c.height/2, R=c.width/2-6, max=8;
+  // Draw in the same frame as the map: canvas y grows downward, so the sine must be
+  // subtracted. The old `t=(a-90)` plus `+sin` folded that flip back in and mirrored the
+  // whole view, putting the car's left on the right of the circle.
+  const hd=(bodyUp?90:(st&&st.pose_raw?st.pose_raw[2]:0))*Math.PI/180;
+  g.strokeStyle='#232a33';g.lineWidth=1;
+  for(const r of [2,4,6,8]){g.beginPath();g.arc(cx,cy,R*r/max,0,7);g.stroke();}
+  g.fillStyle='#59636f';g.font='10px sans-serif';g.fillText('2/4/6/8 m',6,12);
+  g.fillStyle='#4aa3ff';
+  let near=99;
+  for(const [a,d] of (s.pairs||[])){
+    if(d<near)near=d;
+    const t=hd+a*Math.PI/180, r=R*d/max;
+    g.fillRect(cx+r*Math.cos(t)-1, cy-r*Math.sin(t)-1, 2, 2);
+  }
+  g.strokeStyle='#e05252';g.beginPath();g.arc(cx,cy,6,0,7);g.stroke();
+  g.strokeStyle='#ffd23c';g.lineWidth=2;g.beginPath();g.moveTo(cx,cy);
+  g.lineTo(cx+R*0.12*Math.cos(hd),cy-R*0.12*Math.sin(hd));g.stroke();
+  $('near').textContent=near<99?near.toFixed(2):'-';$('npts').textContent=(s.pairs||[]).length;
+}
+setInterval(drawLidar,400);
+
+// ---- camera ---------------------------------------------------------------------------
+// The ESP32's /stream MJPEG never renders in an <img>, so "video" here is a self-paced loop
+// of single frames: each fetch opens the camera socket, so the next one only starts once the
+// previous frame lands.
+async function camLoop(){
+  const my=++camSeq;
+  while(camOn&&my===camSeq){
+    try{
+      const r=await fetch('/api/shot?t='+Date.now());
+      if(!r.ok) throw new Error(r.status);
+      const u=URL.createObjectURL(await r.blob());
+      if(!camOn||my!==camSeq){URL.revokeObjectURL(u);break;}
+      $('cam').src=u;
+      if(camUrl)URL.revokeObjectURL(camUrl);
+      camUrl=u;
+    }catch(e){$('camNote').textContent='图传不可用: '+e.message;break;}
+    await new Promise(res=>setTimeout(res,200));
+  }
+}
+$('camToggle').onclick=e=>{
+  camOn=!camOn;e.target.classList.toggle('on',camOn);
+  if(camOn){$('camNote').textContent='连续抓帧中';camLoop();}
+  else{$('camNote').textContent='已停止';}
+};
+$('shot').onclick=async()=>{
+  camOn=false;$('camToggle').classList.remove('on');camSeq++;
+  $('camNote').textContent='抓帧中';
+  try{
+    const r=await fetch('/api/shot?t='+Date.now());
+    const u=URL.createObjectURL(await r.blob());
+    $('cam').src=u; if(camUrl)URL.revokeObjectURL(camUrl); camUrl=u;
+    $('camNote').textContent='单帧';
+  }catch(e){$('camNote').textContent='抓帧失败: '+e.message;}
+};
+
+// ---- ptz / beep -----------------------------------------------------------------------
+document.querySelectorAll('[data-ptz]').forEach(b=>b.onclick=async()=>{
+  const [y,p]=b.dataset.ptz.split(',').map(Number);
+  if(!y&&!p){return api('/api/ptz',{yaw:0,pitch:0,abs:true});}
+  api('/api/ptz',{yaw:y,pitch:p});
+});
+$('beep').onclick=()=>api('/api/beep',{ms:400});
+
+// ---- calibration ----------------------------------------------------------------------
+$('runCalib').onclick=async e=>{
+  e.target.disabled=true;
+  const r=await api('/api/calib',{vx:+$('cv').value,wz:+$('cw').value,seconds:+$('cs').value});
+  e.target.disabled=false;
+  $('fit').textContent=(r.text||r.error||'')+'\n'+$('fit').textContent;
+};
+document.querySelectorAll('[data-preset]').forEach(b=>b.onclick=()=>{
+  const [v,w,s]=b.dataset.preset.split(',').map(Number);
+  $('cv').value=v;$('cw').value=w;$('cs').value=s;
+});
+$('fitBtn').onclick=async()=>{
+  const r=await api('/api/fit',{});
+  $('fit').textContent='线性样本 '+r.n_linear+'，转向样本 '+r.n_angular+
+    '（左 '+(r.n_ccw??0)+' / 右 '+(r.n_cw??0)+'，'+(r.split?'左右分别拟合':'样本不足，两侧共用一组')+'）'+
+    // without this the gate looks like a bug: 19 logged bursts shrink to 3 and the row says
+    // "线性样本 3" as if nobody drove the car
+    '：日志 '+(r.n_total??'-')+' 条，短于 '+(r.min_dt??'-')+' s 的爬坡段剔除 '+(r.n_short_dropped??0)+' 条'+
+    '\n建议：增益v='+(r.gain_v??'-')+' 左增益w='+(r.gain_w??'-')+' 左偏置='+(r.w_bias??'-')+
+    ' 左死区='+(r.w_dead??'-')+
+    '\n      右增益w='+(r.gain_w_neg??'-')+' 右偏置='+(r.w_bias_neg??'-')+
+    ' 右死区='+(r.w_dead_neg??'-')+
+    '\n残差 rmse v='+(r.v_rmse??'-')+' 左w='+(r.w_rmse??'-')+' 右w='+(r.w_rmse_neg??'-')+
+    '\n当前：v='+r.current.gain_v+' 左w='+r.current.gain_w+' 右w='+r.current.gain_w_neg+
+    ' 基准电压='+r.current.volt_ref+'（这批样本采样时 '+(r.volt_ref_now??'-')+' V）';
+  if(r.gain_v!=null)$('gv').value=r.gain_v;
+  if(r.volt_ref_now)$('vr').value=r.volt_ref_now;
+  if(r.gain_w!=null){$('gw').value=r.gain_w;$('wd').value=r.w_dead;$('wb').value=r.w_bias;}
+  if(r.gain_w_neg!=null){$('gwn').value=r.gain_w_neg;$('wdn').value=r.w_dead_neg;
+    $('wbn').value=r.w_bias_neg;}
+  // focus one of the boxes so the 600 ms poll stops overwriting the row we just filled;
+  // without this the fitted voltage is gone again before 保存并生效 is clicked
+  $('vr').focus();
+};
+$('saveGains').onclick=async()=>{
+  const r=await api('/api/gains',{gain_v:+$('gv').value,volt_ref:+$('vr').value,
+    gain_w:+$('gw').value,w_bias:+$('wb').value,w_dead:+$('wd').value,
+    gain_w_neg:+$('gwn').value,w_bias_neg:+$('wbn').value,w_dead_neg:+$('wdn').value});
+  $('fit').textContent='已生效并写入 nav_gains.json：'+JSON.stringify(r);
+};
+$('fbSend').onclick=async()=>{
+  const t=$('fb').value.trim();if(!t)return;
+  await api('/api/feedback',{note:t,truth:st?st.pose:null});$('fb').value='';
+};
+$('vsel').oninput();$('wsel').oninput();
+</script>
+</body>
+</html>

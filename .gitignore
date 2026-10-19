@@ -1,0 +1,20 @@
+# 厂商资料包：网盘原件，体积大且不是我们的产物（0~24 号目录都以数字开头）
+/[0-9]*/
+
+# 运行期产物与机器相关状态
+__pycache__/
+*.pyc
+cache/
+*.log
+*.jsonl
+*.npy
+*.png
+*.jpg
+*.jpeg
+# 每次拟合都会改写，且记的是"这台车这块电池此刻"的电压基准，不适合当版本内容
+nav_gains.json
+
+# 探针脚本留下的临时输出
+*_probe.json
+_st_probe.json
+_estop.txt

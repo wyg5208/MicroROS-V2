@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>MicroROS-V2 对话开车</title>
+<style>
+:root{--bg:#14171c;--pan:#1c2128;--ed:#2b323c;--fg:#dfe3e8;--dim:#8b95a3;--acc:#4aa3ff;
+      --ok:#3fbf7f;--warn:#e0a63c;--bad:#e05252}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 "Segoe UI",system-ui,sans-serif}
+h1{font-size:15px;margin:0}
+h2{font-size:12px;margin:0 0 8px;color:var(--dim);font-weight:600;letter-spacing:.04em}
+.wrap{display:grid;grid-template-columns:340px 1fr;gap:10px;padding:10px;align-items:start;
+      height:100vh}
+.pan{background:var(--pan);border:1px solid var(--ed);border-radius:8px;padding:10px;
+     display:flex;flex-direction:column;min-height:0}
+.side{gap:10px;overflow:auto}
+.row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+button{background:var(--ed);color:var(--fg);border:1px solid #3a424e;border-radius:6px;
+       padding:6px 10px;font:inherit;cursor:pointer}
+button:hover{background:#39414d}
+button:active{transform:translateY(1px)}
+button:disabled{opacity:.45;cursor:default}
+.allow{background:var(--ok);border-color:var(--ok);color:#08101a;font-weight:700}
+.deny{background:var(--bad);border-color:#ff6b6b;color:#fff;font-weight:700}
+.stop{background:var(--bad);border-color:#ff6b6b;color:#fff;font-weight:700;padding:8px 14px}
+.ptt.rec{background:var(--acc);border-color:var(--acc);color:#08101a;font-weight:700}
+canvas,img{background:#0b0d10;border:1px solid var(--ed);border-radius:6px;display:block;width:100%}
+.stat{display:grid;grid-template-columns:auto 1fr;gap:2px 8px;font-variant-numeric:tabular-nums}
+.stat b{font-weight:600}
+.hint{color:var(--dim);font-size:11px}
+.feed{flex:1;overflow:auto;background:#0f1216;border:1px solid var(--ed);border-radius:6px;
+      padding:8px;min-height:120px}
+.msg{border-bottom:1px solid #1a1f26;padding:6px 0;white-space:pre-wrap;word-break:break-word}
+.msg:last-child{border-bottom:0}
+.msg .who{color:var(--dim);font-size:11px;letter-spacing:.04em;display:block}
+.msg.user .who{color:var(--acc)}
+.msg.bot{background:#181f27;border-left:3px solid var(--acc);padding:6px 8px;border-radius:0 6px 6px 0}
+.msg.tool .body{font:11px/1.5 Consolas,monospace;color:#c3ccd8}
+.msg.err{border-left:3px solid var(--warn);background:#231a10;padding:6px 8px}
+.msg.bad{border-left:3px solid var(--bad);background:#241315;padding:6px 8px}
+.msg.note{color:var(--dim);font-size:11px}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mono{font-family:Consolas,monospace}
+.card{background:#2a2113;border:1px solid var(--warn);border-radius:8px;padding:10px;margin-top:8px}
+.card .args{font:12px/1.5 Consolas,monospace;color:#ffe6bd;margin:6px 0}
+.bar{height:4px;background:var(--warn);border-radius:2px;margin-top:8px}
+.bar i{display:block;height:100%;background:#7a5c1f;border-radius:2px}
+textarea{width:100%;background:#0f1216;color:var(--fg);border:1px solid var(--ed);
+         border-radius:6px;padding:8px;font:inherit;resize:vertical;min-height:52px}
+.spread{justify-content:space-between}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--dim);
+     margin-right:5px;vertical-align:1px}
+.dot.on{background:var(--ok)}.dot.think{background:var(--warn);animation:bl 1s infinite}
+.dot.off{background:var(--bad)}
+@keyframes bl{50%{opacity:.25}}
+@media(max-width:900px){.wrap{grid-template-columns:1fr;height:auto}.side{max-height:340px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <section class="pan side">
+    <div class="row spread"><h1>MicroROS-V2</h1><span class="hint"><span id=link class="dot"></span><span id=linkTxt>连接中</span></span></div>
+    <div>
+      <h2>地图（取自 :8010）</h2>
+      <img id=map alt="地图">
+      <div class="row" style="margin-top:6px">
+        <label>视野 <select id=half><option value=3>近 3 m</option><option value=6 selected>6 m</option><option value=12>12 m</option></select></label>
+        <label><input type=checkbox id=lidar checked> 雷达点</label>
+        <button id=mapNow>刷新地图</button>
+      </div>
+    </div>
+    <div>
+      <h2>车现在</h2>
+      <div class=stat id=stat></div>
+      <div class="row" style="margin-top:6px">
+        <button id=shotBtn>看一帧画面</button>
+        <label><input type=checkbox id=shotAuto> 连续</label>
+      </div>
+      <img id=shot alt="相机画面" hidden style="margin-top:6px">
+    </div>
+    <div>
+      <h2>能调的工具</h2>
+      <div class="hint" id=tools>—</div>
+    </div>
+    <div class="hint">这一页只做两件事：把你的话交给大模型，把模型的每一步摊开给你看。
+      动作下发走 MCP(:8000)，"轮子到底动没动"读控制台(:8010) 的实测位姿，两边都给。</div>
+  </section>
+
+  <section class="pan">
+    <div class="row spread">
+      <h1>对话开车</h1>
+      <div class="row">
+        <span class="hint" id=turns></span>
+        <button id=estop class=stop title="立即停车：发 MCP Stop 与控制台急停">急停</button>
+        <button id=resetCtx>清空上下文</button>
+      </div>
+    </div>
+    <div class=feed id=feed></div>
+    <div id=approvals></div>
+    <div style="margin-top:8px">
+      <textarea id=text placeholder="例如：前进 0.2 米，然后看看前面有什么，最后报一下你在地图哪里。（Enter 发送，Shift+Enter 换行）"></textarea>
+      <div class="row spread" style="margin-top:6px">
+        <span class=hint id=status></span>
+        <span>
+          <label class=hint title="不勾选时动作直接执行；急停按钮和最大位移/转角限制照旧生效"><input type=checkbox id=needConfirm> 执行是否需要确认</label>
+          <label class=hint><input type=checkbox id=autoscroll checked> 自动滚到底</label>
+          <label class=hint title="用系统 SAPI 嗓把助手的回复念出来；急停会同时闭嘴"><input type=checkbox id=speak> 朗读回复</label>
+          <button id=ptt title="按住说话，松手转成文字填进输入框；文字要你确认后才发给大模型（Esc 取消）">按住说话</button>
+          <button id=send>发送</button>
+        </span>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const feed = $("feed"), approvals = $("approvals");
+let busy = false, seen = 0, es = null, cards = {};
+
+function el(tag, cls, text){
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);  // 只走 textContent：模型输出不可当 HTML
+  return n;
+}
+function msg(cls, who, body){
+  const m = el("div", "msg " + cls);
+  if (who) m.appendChild(el("span", "who", who));
+  if (body !== undefined && body !== null) m.appendChild(el("span", "body", body));
+  feed.appendChild(m);
+  if ($("autoscroll") && $("autoscroll").checked) feed.scrollTop = feed.scrollHeight;
+  return m;
+}
+function note(t){ msg("note", null, t); }
+const short = s => (s || "").replace(/\s+/g, " ").trim();
+const secs = v => (v ? v.toFixed(1) + " s" : "");
+
+function pretty(o){ try { return JSON.stringify(o); } catch (e) { return String(o); } }
+
+function addLine(m, txt, cls){
+  const s = el("span", "body", "\n" + txt);
+  if (cls) s.className = "body " + cls;
+  m.appendChild(s);
+}
+
+function onEvent(ev){
+  if (ev.seq && ev.seq <= seen) return;    // snapshot 与实时流会重叠，按 seq 去重
+  if (ev.seq) seen = Math.max(seen, ev.seq);
+  switch (ev.type) {
+    case "user":  msg("user", "你", ev.text); break;
+    case "thinking": setBusy(true, "模型正在想…"); break;
+    case "llm": setBusy(true, "模型回话用了 " + secs(ev.secs)); break;
+    case "call": {
+      const m = msg("tool", "第 " + ev.step + " 步 · 调用 " + ev.tool, pretty(ev.args));
+      if (ev.pose0) addLine(m, "动作前位姿 " + pretty(ev.pose0.map(x => +x.toFixed(2))));
+      setBusy(true, ev.tool + " 执行中…");
+      break;
+    }
+    case "result": {
+      const bad = /^(失败|MCP 调用异常|工具执行失败)/.test(short(ev.text));
+      const m = msg(bad ? "bad" : "tool", "结果 · " + ev.tool + (ev.secs ? " · " + secs(ev.secs) : ""), short(ev.text));
+      if (ev.measured) {
+        const d = ev.measured;
+        addLine(m, "实测：位移 " + d.delta.toFixed(2) + " m、转向 " + d.dyaw.toFixed(0) + "°，现在 " + pretty(d.pose.map(x => +x.toFixed(2))), "mono ok");
+      }
+      break;
+    }
+    case "cancelled": msg("note", "已取消", ev.tool + " 没有被执行（你点了拒绝或确认超时）"); break;
+    case "auto_denied": msg("note", "自动拒绝", ev.tool + " 没有下发：本轮已经拒绝过一次，模型再请求也不会重新问你。想继续就重新说一句指令。"); break;
+    case "approval": makeCard(ev); break;
+    case "approval_decided":
+    case "approval_expired": killCard(ev.id, ev.type === "approval_expired" ? "超时，默认拒绝" : (ev.allow ? "已允许" : "已拒绝")); break;
+    case "image": {
+      const m = msg("tool", "画面", "");
+      const img = el("img"); img.src = "/img?path=" + encodeURIComponent(ev.path); img.alt = "工具拍到的画面";
+      m.appendChild(img); break;
+    }
+    case "assistant": msg("bot", "助手", ev.text); speakIt(ev.text); break;
+    case "badargs": msg("err", "参数有误", ev.tool + " -> " + ev.text); break;
+    case "error": msg("err", "出错", ev.text); break;
+    case "limit": note("已达到单轮最大工具调用次数，这条指令到此为止；再说什么请重新发。"); break;
+    case "estop": msg("bad", "急停已发出", short(ev.text)); break;
+    case "context_trimmed": note("上下文太长，已截到 " + ev.n + " 条。"); break;
+    case "context_cleared": note("上下文已清空（只留系统规则）。"); break;
+    case "turn_end": setBusy(false); $("turns").textContent = "共 " + ev.turns + " 条指令"; break;
+    case "snapshot":
+      note("— 以下是之前 " + ev.events.length + " 条记录 —");
+      speakMuted = true;                    // 重放旧回复时别把它们挨个念一遍
+      try { ev.events.forEach(onEvent); } finally { speakMuted = false; }
+      if (ev.busy) setBusy(true, "上一条还在执行");
+      break;
+  }
+}
+
+function makeCard(ev){
+  const card = el("div", "card");
+  card.appendChild(el("h2", null, "要你确认：" + ev.tool));
+  card.appendChild(el("div", "args", pretty(ev.args)));
+  card.appendChild(el("div", "hint", "大模型想让它真的动。点了「允许」才会下发；" + ev.seconds + " 秒内没人点就按拒绝处理。"));
+  const row = el("div", "row");
+  const ok = el("button", "allow", "允许执行");
+  const no = el("button", "deny", "拒绝");
+  ok.onclick = () => answer(ev.id, true, card);
+  no.onclick = () => answer(ev.id, false, card);
+  row.append(ok, no);
+  card.appendChild(row);
+  const bar = el("div", "bar"); const fill = el("i");
+  bar.appendChild(fill); card.appendChild(bar);
+  approvals.appendChild(card);
+  cards[ev.id] = {card, fill, t0: Date.now(), ms: ev.seconds * 1000, ok, no};
+  tickCards();
+}
+function answer(id, allow, card){
+  post("/approval", {id, allow})
+    .then(r => { if (!r.ok) note("这条确认已作废：" + (r.error || "")); })
+    .catch(e => note("发送确认失败：" + e))
+    .finally(() => { card.querySelectorAll("button").forEach(b => b.disabled = true); });
+}
+function killCard(id, why){
+  const c = cards[id];
+  if (!c) return;
+  c.card.querySelector(".args").textContent += "  → " + why;
+  c.card.style.borderColor = "var(--dim)"; c.card.style.opacity = ".6";
+  delete cards[id];
+  setTimeout(() => c.card.remove(), 1200);
+}
+function tickCards(){
+  const now = Date.now();
+  Object.values(cards).forEach(c => {
+    const left = 1 - (now - c.t0) / c.ms;
+    c.fill.style.width = Math.max(0, left * 100).toFixed(1) + "%";
+  });
+}
+setInterval(tickCards, 200);
+
+function setBusy(b, text){
+  busy = b;
+  $("send").disabled = b;
+  $("status").textContent = b ? (text || "执行中…") : "空闲，可以下指令";
+  $("status").className = "hint" + (b ? " warn" : "");
+}
+
+function post(path, body){
+  return fetch(path, {method: "POST", headers: {"Content-Type": "application/json"},
+                      body: JSON.stringify(body || {}),
+                      cache: "no-store"})
+    .then(async r => { const t = await r.text();
+      try { const j = JSON.parse(t); j.ok = j.ok !== false && r.ok; j.status = r.status; return j; }
+      catch (e) { return {ok: r.ok, status: r.status, error: t}; } });
+}
+
+function send(){
+  const text = $("text").value.trim();
+  if (!text || busy) return;
+  post("/chat", {text, confirm: $("needConfirm").checked}).then(r => {
+    if (!r.ok) { note("没发出去（" + r.status + "）：" + (r.error || "")); return; }
+    $("text").value = "";
+  }).catch(e => note("发送失败：" + e));
+}
+$("send").onclick = send;
+$("needConfirm").checked = localStorage.getItem("carChatConfirm") === "1";
+$("needConfirm").addEventListener("change", e => {
+  localStorage.setItem("carChatConfirm", e.target.checked ? "1" : "0");
+  note(e.target.checked ? "已开启确认：每个动作都会先弹卡片等你点允许。"
+                        : "已关闭确认：动作直接执行，靠急停按钮和 0.5 m / 90° 上限兜底。");
+});
+$("text").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("estop").onclick = () => post("/stop", {}).then(r => {
+  if (!r.ok) note("急停请求失败：" + (r.error || r.status));
+});
+$("resetCtx").onclick = () => post("/reset", {}).then(r => {
+  if (!r.ok) note("清空失败：" + (r.error || r.status));
+});
+
+// ---- 语音：按住说话 + SAPI 朗读 ----
+// 这条路上没有任何转码：浏览器直接录 16 kHz 单声道、自己拼 WAV 头，原始字节 POST 给 /asr；
+// 本机没有 ffmpeg，也正因为不需要它。转出来的文字只填进输入框，仍要你按下发送才变成动作。
+let rec = null, recTick = null, speakMuted = false, asrBusy = false;
+
+function wav16(samples, rate){
+  const n = samples.length, dv = new DataView(new ArrayBuffer(44 + 2 * n));
+  const str = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); dv.setUint32(4, 36 + 2 * n, true); str(8, "WAVE");
+  str(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  str(36, "data"); dv.setUint32(40, 2 * n, true);
+  for (let i = 0; i < n; i++) {
+    const v = Math.max(-1, Math.min(1, samples[i]));
+    dv.setInt16(44 + 2 * i, v < 0 ? v * 32768 : v * 32767, true);
+  }
+  return dv.buffer;
+}
+
+async function recStart(){
+  if (rec) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    note("这个浏览器不给麦克风（getUserMedia 只在 localhost 或 https 下可用）。"); return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia(
+      {audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true}});
+  } catch (e) {
+    note("拿不到麦克风：" + e.name + " " + (e.message || "") + "（浏览器拦了权限，或没有输入设备）"); return;
+  }
+  let ac;
+  try { ac = new AudioContext({sampleRate: 16000}); } catch (e) { ac = new AudioContext(); }
+  const node = ac.createScriptProcessor(4096, 1, 1);
+  const chunks = [], st = {peak: 0};
+  // ScriptProcessor 只有在连到目的地之后才会被回调；用一个 0 增益节点接着，
+  // 免得把麦克风原样放到喇叭上叫成一片（朗读和说话共用这一台机器）。
+  const sink = ac.createGain(); sink.gain.value = 0;
+  ac.createMediaStreamSource(stream).connect(node); node.connect(sink); sink.connect(ac.destination);
+  node.onaudioprocess = e => {
+    const d = e.inputBuffer.getChannelData(0);
+    chunks.push(new Float32Array(d));
+    for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > st.peak) st.peak = a; }
+  };
+  rec = {ac, stream, node, sink, chunks, st, rate: ac.sampleRate, t0: Date.now()};
+  $("ptt").classList.add("rec");
+  recTick = setInterval(() => {
+    const s = (Date.now() - rec.t0) / 1000;
+    $("ptt").textContent = "松开转写 " + s.toFixed(1) + " s" + (rec.st.peak < 0.01 ? "（听不到声音）" : "");
+  }, 200);
+}
+
+async function recStop(cancel){
+  if (!rec) return;
+  const r = rec; rec = null;
+  clearInterval(recTick); recTick = null;
+  $("ptt").classList.remove("rec"); $("ptt").textContent = "按住说话";
+  try { r.node.onaudioprocess = null; r.node.disconnect(); r.sink.disconnect();
+        r.stream.getTracks().forEach(t => t.stop()); await r.ac.close(); } catch (e) {}
+  const total = r.chunks.reduce((a, c) => a + c.length, 0);
+  if (cancel) { note("这次录音取消了"); return; }
+  const secs = total / r.rate;
+  if (secs < 0.4) { note("太短了（" + secs.toFixed(1) + " s），按住说完再松手"); return; }
+  if (r.st.peak < 0.01) { note("整段几乎没有声音（峰值 " + r.st.peak.toFixed(3) + "）——麦克风可能被系统静音了"); return; }
+  const merged = new Float32Array(total);
+  let off = 0; for (const c of r.chunks) { merged.set(c, off); off += c.length; }
+  $("ptt").disabled = true; asrBusy = true; $("status").textContent = "转写中…";
+  fetch("/asr", {method: "POST", headers: {"Content-Type": "application/octet-stream"},
+                 body: wav16(merged, r.rate), cache: "no-store"})
+    .then(async res => { const j = await res.json().catch(() => ({}));
+      if (!res.ok || !j.ok) { note("转写失败（" + res.status + "）：" + (j.error || "")); return; }
+      const box = $("text"), old = box.value.trim();
+      box.value = old ? old + " " + j.text : j.text;
+      box.focus(); box.setSelectionRange(box.value.length, box.value.length);
+      note("听到 " + secs.toFixed(1) + " s -> 「" + j.text + "」" +
+           (j.heard ? "（原听成「" + j.heard + "」，纠了 " + j.fixes.join("、") + "）" : "") +
+           "（" + j.secs + " s 转完，核对一下再发送）");
+    })
+    .catch(e => note("转写请求失败：" + e))
+    .finally(() => { asrBusy = false; $("ptt").disabled = false;
+                     if (!busy) $("status").textContent = "空闲，可以下指令"; });
+}
+
+$("ptt").addEventListener("pointerdown", e => { e.preventDefault();
+  if (e.pointerType === "mouse" ? e.button === 0 : true) { try { $("ptt").setPointerCapture(e.pointerId); } catch (err) {} recStart(); } });
+$("ptt").addEventListener("pointerup", e => { e.preventDefault(); recStop(false); });
+$("ptt").addEventListener("pointercancel", () => recStop(true));
+$("ptt").addEventListener("contextmenu", e => e.preventDefault());
+window.addEventListener("keydown", e => { if (e.key === "Escape" && rec) recStop(true); });
+
+function speakIt(text){
+  if (speakMuted || !$("speak").checked) return;
+  const t = String(text || "").replace(/[*_`>#|]+/g, " ").replace(/\s+/g, " ").trim();
+  if (t) post("/speak", {text: t}).catch(() => {});
+}
+$("speak").checked = localStorage.getItem("carChatSpeak") === "1";
+$("speak").addEventListener("change", e => {
+  localStorage.setItem("carChatSpeak", e.target.checked ? "1" : "0");
+  if (e.target.checked) post("/speak", {text: "朗读已打开"}).catch(() => {});
+  else post("/speak_stop", {}).catch(() => {});
+});
+
+// ---- 状态轮询 ----
+const fmt = (v, n = 2) => (typeof v === "number" ? +v.toFixed(n) : (v === undefined || v === null ? "—" : v));
+function renderStat(c, chat, v){
+  const s = $("stat"); s.textContent = "";
+  const asr = (v && v.asr) || {}, tts = (v && v.tts) || {};
+  const rows = [
+    ["位姿", c.pose ? pretty(c.pose.map(val => fmt(val))) + "（x, y, 朝向°）" : "—"],
+    ["链路", "里程计 " + fmt(c.odom_age, 1) + " s / 雷达 " + fmt(c.scan_age, 1) + " s"],
+    ["电池", fmt(c.volts) + " V"],
+    ["电机", c.busy ? String(c.busy) : (c.teleop && (c.teleop.v || c.teleop.w) ? "点动中" : "空闲")],
+    ["建图", c.mapping ? "开" : (c.frozen ? "暂停（等人工确认位置）" : "关")],
+    ["雷达↔地图", c.agree !== undefined ? fmt(c.agree * 100, 0) + "%" : "—"],
+    ["语音", (asr.path_error ? "whisper 装在带中文的路径里，用不了（挪到纯英文路径）"
+             : asr.ready ? "whisper " + asr.model : "识别没装（README 的「语音」一节）") +
+             (tts.ready ? " / 朗读 " + tts.voice : " / 无朗读") +
+             (tts.last && tts.last.indexOf("没出声") >= 0 ? "（" + tts.last + "）" : "")],
+    ["这一页", chat.busy ? "回合执行中" : "空闲"],
+  ];
+  rows.forEach(([k, val]) => { s.appendChild(el("b", null, k)); s.appendChild(el("span", null, val)); });
+  const up = !!c.online;
+  $("link").className = "dot " + (up ? "on" : "off");
+  $("linkTxt").textContent = up ? "车侧在线" : "车侧读不到（bridge 没起？）";
+  if (!rec && !asrBusy) $("ptt").disabled = !asr.ready;
+}
+setInterval(() => {
+  fetch("/state", {cache: "no-store"}).then(r => r.json())
+    .then(j => { renderStat(j.car || {}, j.chat || {}, j.voice || {}); })
+    .catch(() => { $("link").className = "dot off"; $("linkTxt").textContent = "聊天服务本身没响应"; });
+}, 1000);
+
+// ---- 地图 / 画面 ----
+function mapSrc(){
+  return "/map.png?half=" + encodeURIComponent($("half").value) +
+         "&lidar=" + ($("lidar").checked ? "1" : "0") + "&t=" + Date.now();
+}
+function drawMap(){ $("map").src = mapSrc(); }
+$("half").onchange = drawMap; $("lidar").onchange = drawMap; $("mapNow").onclick = drawMap;
+setInterval(drawMap, 2500);
+
+function drawShot(){ const i = $("shot"); i.hidden = false; i.src = "/shot?t=" + Date.now(); }
+$("shotBtn").onclick = drawShot;
+setInterval(() => { if ($("shotAuto").checked) drawShot(); }, 2000);
+
+fetch("/tools", {cache: "no-store"}).then(r => r.json())
+  .then(j => { $("tools").textContent = (j.tools || []).map(t => t.name).join(" / ") || "—"; })
+  .catch(() => {});
+
+// ---- 事件流（断了自动重连） ----
+function connect(){
+  es = new EventSource("/events");
+  es.onopen = () => { $("link").classList.remove("off"); };
+  es.onmessage = e => {
+    let ev; try { ev = JSON.parse(e.data); } catch (err) { return; }
+    if (ev.type === "snapshot") { feed.textContent = ""; seen = 0; }
+    onEvent(ev);
+  };
+  es.onerror = () => {
+    $("link").className = "dot off"; $("linkTxt").textContent = "事件流断开，正在重连";
+    es.close(); setTimeout(connect, 1500);
+  };
+}
+connect();
+note("说明：拒绝或 60 秒没人点＝不下发。急停按钮任何时候都能点。");
+</script>
+</body>
+</html>
