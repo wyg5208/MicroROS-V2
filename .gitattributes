@@ -1,0 +1,28 @@
+# Windows runs .bat/.ps1 by byte-offset line splitting, and cmd.exe's label/goto handling
+# breaks on LF-only files, so the batch layer must always land on disk as CRLF -- including
+# when someone clones from a machine with core.autocrlf=input or false.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Everything the PC-side stack edits by hand stays LF: python imports are byte-position
+# agnostic, and the console/thinking code reads these files as UTF-8 text.
+*.py    text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.toml  text eol=lf
+
+# Not text at all -- mapping grids, captured images, firmware blobs.
+*.png  binary
+*.jpg  binary
+*.npy  binary
+*.npz  binary
+*.bin  binary
+*.gz   binary
+*.zip  binary
+*.gguf binary
+*.pdf  binary
