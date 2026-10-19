@@ -14,6 +14,8 @@
   5 图上那个数字就是列表里那一行：紫色点的连通块与 ax_text 记录的编号一一对上，
     而且关掉坐标轴也得有数字（曾经只在 axes 打开的那个分支里画）；车站在词上时红点盖住紫点
   6 中文标签存得回来（json 必须 ensure_ascii=False，否则文件里是 \\u5ba2\\u5385）
+  7 `MapInfo` 那句地点话本身：只列最近 4 个时要把"只列"说出来、列的必须是最近的 4 个、
+    ≤4 个时不许谎称还有、要说"全部列出"、坐标是减过显示原点的那一套
 
 Run: C:\\microros-agent\\pc_side\\_rosrun.bat _places_test.py
 """
@@ -49,6 +51,7 @@ class Car:
         self.yaw = yaw
         self.bias = (0.0, 0.0)
         self.pairs = []
+        self.volts = 12.0                       # map_view 会念电池，缺了它整句就拼不出来
         self.pose = (x, y, yaw, 0.0)
 
     def set_bias(self, bx, by):
@@ -68,6 +71,7 @@ class Stub:
     places_near = car_web.Console.places_near
     render_map = car_web.Console.render_map
     reset_map = car_web.Console.reset_map
+    map_view = car_web.Console.map_view
 
     def __init__(self, pose=(0.0, 0.0, 0.0)):
         self.lock = threading.Lock()
@@ -79,6 +83,10 @@ class Stub:
         self.map_cache = {}
         self.logs = []
         self.mapping = False
+        self.busy = ""
+        self.tour = None
+        self.drift = {"n": 0, "total": 0.0, "est": [0.0, 0.0]}
+        self.motion = {"at": None, "outside": None, "bad": 0, "n": 0, "why": None}
         self.reloc = {"frozen": True, "agree": None, "best": None, "cand": [], "trial": None}
         self.watch_hist = []
         self.watch_bad = 3
@@ -280,6 +288,36 @@ with open(bad.places_file, "w", encoding="utf-8") as fh:
     fh.write("not json at all")
 bad._load_places()
 check("  整个文件是垃圾时从空白开始，而不是把 bridge 拖崩", bad.places, [])
+
+# ------------------------------------------------ 7 MapInfo 那句地点话 ----
+# 手册把"一次只列最近 4 个"和"显示系减过原点"写成了承诺，那就得由回归钉住，不能靠我写文档时算对。
+import re
+
+st10 = Stub(pose=(0.0, 0.0, 0.0))
+for i, (px_, py_) in enumerate([(0.5, 0.0), (1.0, 0.0), (1.5, 0.0),
+                                (2.0, 0.0), (9.0, 0.0), (9.5, 0.0)]):
+    st10.places.append({"label": "P%d" % i, "x": px_, "y": py_, "yaw": 0.0})
+line = [l for l in st10.map_view().split("\n") if l.startswith("记住的地点")]
+check("六个词只列得下四个，但句子要说清「共 6 个」和「按远近只列最近 4 个」",
+      [len(line), bool(re.search(r"共 6 个，按远近", line[0] or "")),
+       bool(re.search(r"按远近只列最近 4 个", line[0] or ""))] if line else [0, False, False],
+      [1, True, True])
+listed = re.findall(r"「(P\d)」", line[0]) if line else []
+check("  列出来的是最近的四个（P0..P3），不是插入顺序的前四个凑数", listed, ["P0", "P1", "P2", "P3"])
+st10.places = st10.places[:4]
+line4 = [l for l in st10.map_view().split("\n") if l.startswith("记住的地点")]
+check("  四个及以内不许出现「只列最近」这句（那就是全部，别让人以为还有）",
+      bool(re.search(r"只列最近", line4[0])), False)
+check("  但要说「全部列出」：列全了和截断了得能靠这句话区分开",
+      bool(re.search(r"共 4 个，按远近全部列出", line4[0])), True)
+check("  一个词都没记时整句不提地点（模型不会看到一句关于空气的话）",
+      any(l.startswith("记住的地点") for l in Stub().map_view().split("\n")), False)
+st10.origin = (1.0, 0.0)                          # 点过一次"把这里设为原点"
+line_o = [l for l in st10.map_view().split("\n") if l.startswith("记住的地点")][0]
+d0 = float(re.search(r"「P0」[\d.]+ m [+-]?\d+°（显示系 (-?[\d.]+), ", line_o).group(1))
+check("  句子里那对坐标是**减过显示原点**的（P0 记在 0.5，原点挪到 1.0 之后该写 -0.50）",
+      [d0, round(st10.places[0]["x"], 2)], [-0.5, 0.5])
+
 
 print("\n%s" % ("全部通过" if not fails else "失败 %d 项: %s" % (len(fails), fails)))
 sys.exit(1 if fails else 0)

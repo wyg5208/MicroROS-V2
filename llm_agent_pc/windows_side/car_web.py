@@ -1521,14 +1521,21 @@ class Console:
                           " ".join(str(h) for h in hist), len(hist) // 2))
         near = self.places_near(pose)
         if near:
-            out.append("记住的地点（共 %d 个，按远近）：%s；问「XX 在哪」就答这个，"
+            # Spell out the cap. `places_near` only returns the nearest 4 and the model has no other
+            # way to know it is looking at a subset, so "共 9 个" followed by four lines would invite
+            # it to answer "就这些" -- the same class of lie as a stale tool count in a prompt.
+            more = len(self.places) - len(near)
+            out.append("记住的地点（共 %d 个，按远近%s）：%s；问「XX 在哪」就答这个，"
                        "要说新地点用 Remember，说不要了用 Forget"
-                       % (len(self.places), "，".join(
-                           "「%s」%.1f m %+.0f°（显示系 %.2f, %.2f）"
-                           % (r["label"], r["dist"], r["bearing"], r["map"][0], r["map"][1])
-                           for r in near)))
-        elif self.places:
-            out.append("记住的地点：%d 个，但都不在当前位姿的可见范围内。" % len(self.places))
+                       % (len(self.places),
+                          "只列最近 %d 个" % len(near) if more else "全部列出",
+                          "，".join(
+                              "「%s」%.1f m %+.0f°（显示系 %.2f, %.2f）"
+                              % (r["label"], r["dist"], r["bearing"], r["map"][0], r["map"][1])
+                              for r in near)))
+        # No "but none of them are visible" branch: map_view already returned early when the
+        # bridge never got a pose, and with a pose in hand places_near always yields at least one
+        # row, so the sentence that used to sit here could only ever describe an impossible map.
         out.append("电机：%s" % (("被 %s 占用" % busy) if busy else
                                 ("巡游中" if touring else "空闲")))
         return "\n".join(out)

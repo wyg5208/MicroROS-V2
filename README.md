@@ -132,11 +132,11 @@ Microros-V2/
 "跑 Tour 绕行"按钮、以及搬动/重定位横幅（可点选候选位置）。
 
 后端 REST 面：`GET /api/state|scan|map.png|shot|log|drift`，
-`POST /api/teleop|stop|ptz|mapping|reloc|origin|calib|tour|gains|fit|feedback|beep`。
+`POST /api/teleop|stop|ptz|mapping|reloc|origin|calib|tour|gains|fit|feedback|beep|places`。
 
 ### 3.3 网页聊天入口（:8020，`car_chat.py` + `car_chat_ui.html`）
 
-左边是车（地图 / 实时画面 / 位姿 / 电量 / 建图与冻结状态 / 13 个工具名），
+左边是车（地图 / 实时画面 / 位姿 / 电量 / 建图与冻结状态 / 15 个工具名，`:8020/tools` 实测），
 右边是话（你的输入框、模型每一步的卡片、助手回复、急停与清空上下文）。要点：
 
 - **过程摊开给看**：`call → result` 每条都带工具自报的原文与耗时；自主动作（`Move/Tour/MapSpin`）
@@ -329,7 +329,8 @@ medium-q5_0 **6.7-8.0 s 且准确率没换来东西**。慢一档换不到准就
   原地 30° 实测 29.81°），但**停滞/脱困的判据仍只在 0.5 m 上验过**，长命令上的窗口表现没量；
 - Tour 磨墙产生假墙（重定位假告警的源头），需在规划侧抑制；
 - 全局观已经通过 `MapInfo` 递给大模型（未测格数、最近前沿距离与方位、12 扇区未测直方图、
-  吻合度与判定、漂移花费）；还缺的是**语义记忆层**（"上次在哪发现了什么"）与长程目标循环，
+  吻合度与判定、漂移花费）；**语义记忆层已交付**（`Remember`/`Forget`，词与格子同框、清空地图即作废，
+  `MapInfo` 结尾按远近报出地点并说清"共 N 个 / 只列最近 4 个"）；还缺的是**长程目标循环**，
   以及定时/自主巡游的触发方式（倾向用外部调度发消息给会话，而不是在 bridge 里再造 scheduler）
 
 **这一轮收掉的旧账**（留个名字，免得下次又当未知去查）：人工急停与机器自停已分道；
