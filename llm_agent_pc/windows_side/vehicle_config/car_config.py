@@ -40,6 +40,12 @@ def find_port(prefer=None):
 def open_robot(args):
     port = find_port(args.port)
     print("串口: %s @115200" % port)
+    # Measured 2026-10-19: /odom_raw came back as exactly (0,0,0) after a read-only probe that
+    # never called reboot_device(). Opening the port pulses the CP210x control lines, and the
+    # board resets on that edge -- config_robot.__init__ drops DTR/RTS only afterwards.
+    # So there is no non-destructive serial read here: any command below costs the odom anchor.
+    print("提醒: 一开串口控板就会复位，/odom_raw 归零，在用地图的里程计基准会错位；"
+          "读完请重定位（控制台「选偏移」）或重画地图。")
     robot = MicroROS_Robot(port=port, debug=args.verbose)
     time.sleep(0.5)
     robot._MicroROS_Robot__ser.flushInput()
@@ -196,7 +202,7 @@ def main():
     s = sub.add_parser("scale", help="读/写固件速度标定 0x0A（改的是 odom 尺度，不是 PC 侧响应增益）")
     s.add_argument("--linear", type=float, help="线速度尺度，0.1~5.0；不给就保持当前值")
     s.add_argument("--angular", type=float, help="角速度尺度，0.1~5.0；协议只有一个字段，左右共用")
-    s.add_argument("--show", action="store_true", help="只读不写")
+    s.add_argument("--show", action="store_true", help="只读不写（仍会复位控板，见 open_robot）")
     s.set_defaults(func=cmd_scale)
 
     f = sub.add_parser("factory", help="恢复出厂默认（擦除 NVS）")
