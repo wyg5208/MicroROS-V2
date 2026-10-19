@@ -51,6 +51,15 @@ ACT_GAIN_W_NEG = ACT_GAIN_W
 ACT_W_BIAS_NEG = ACT_W_BIAS
 ACT_W_DEAD_NEG = ACT_W_DEAD
 
+# The command below which the wheels do not turn at all, measured rather than extrapolated.
+# *_DEAD above is where the least-squares line crosses zero, and it is optimistic: sweeping
+# 22 long bursts (0.08 -> 1.0 rad/s, both signs, 12.1 V) on 2026-10-19, wz=0.08 delivered
+# 0.000 rad/s on both sides with the gyro agreeing, while the fitted line extrapolated
+# 0.064/0.076. The lowest command that moved the car was 0.12. Predicting rotation inside that
+# band is how a planner picks an arc the chassis will not make -- and why the turn floor below
+# cannot simply be "2 x the fitted deadband".
+ACT_W_CUTON = 0.12
+
 # Same battery, same command, less speed. The board drives 12 V motors off a 3S pack, so the
 # achievable duty -- and with it the whole response -- shrinks as the pack sags. /battery
 # republishes the fitted voltage into ACT_VOLTS and the gains are scaled by the ratio to the
@@ -68,6 +77,19 @@ def volt_scale():
     return max(VOLT_CLAMP[0], min(VOLT_CLAMP[1], ACT_VOLTS / ACT_VOLT_REF))
 
 
+# The smallest turn command worth sending, and it belongs to the chassis model rather than to any
+# one loop: the closed-loop tail, the heading hold and the planner all have to refuse to command
+# inside the band the wheels ignore. Measured 2026-10-19: 0.15 rad/s delivers 4.6/3.9 deg/s
+# left/right and still 3.3 at the 10.3 V lock-out, while the fitted deadband alone would say 0.064.
+TURN_FLOOR_MIN = 0.15
+TURN_DEAD_MULT = 2.5               # ... and stay this far above whatever the current fit extrapolates
+
+
+def turn_floor():
+    """Lowest wz (rad/s, commanded) that is not a command to stand still."""
+    return max(TURN_FLOOR_MIN, TURN_DEAD_MULT * max(ACT_W_DEAD, ACT_W_DEAD_NEG))
+
+
 def achieved(v, w):
     """A commanded twist -> the twist the chassis actually delivers."""
     k = volt_scale()
@@ -75,7 +97,7 @@ def achieved(v, w):
         gain, bias, dead = ACT_GAIN_W_NEG, ACT_W_BIAS_NEG, ACT_W_DEAD_NEG
     else:
         gain, bias, dead = ACT_GAIN_W, ACT_W_BIAS, ACT_W_DEAD
-    if abs(w) < dead:
+    if abs(w) < max(dead, ACT_W_CUTON):     # the fit extrapolates a cut-on; the bench found a later one
         w = 0.0
     else:
         w = math.copysign(max(0.0, gain * abs(w) - bias), w)

@@ -33,8 +33,9 @@ CMD_PERIOD = 0.05          # board expects a continuous cmd_vel stream
 ODOM_TOPIC = "/odom_raw"   # the board's own odometry; /odom only exists in the vendor VM stack
 # Heading hold for straight moves: a `Move forward` that publishes w=0.0 on every tick wanders,
 # and the sign flips from run to run -- so what was missing is feedback, not a wheel trim to tune
-# out. The floor matters more than the gain: this board's response is
-# w_act = 0.857*w_cmd - 0.101*sign(w_cmd), so a command under ~0.15 rad/s is physically ignored.
+# out. The floor matters more than the gain: this board ignores a turn command below roughly
+# 0.12 rad/s (nav.ACT_W_CUTON, measured across the sweep), so a trim smaller than that is a
+# command to stand still and the hold silently does nothing.
 HOLD_DEAD = math.radians(2.0)    # heading error tolerated before correcting
 HOLD_KP = 6.0                    # rad/s commanded per rad of error (reaches the cap at 3 deg)
 HOLD_MIN = 0.22                  # rad/s: the smallest correction the chassis actually obeys
@@ -57,12 +58,11 @@ HOLD_MAX = 0.35                  # rad/s: a third of CAP_W, so a hold can never 
 # test happened to release at the same full rate, and it is wrong for the 15 deg turns it was
 # fitted on (5 of 15 is a third of the command).
 COAST_TAU = 0.08                   # s the board keeps sliding after the last commanded twist
-# A turn command below nav.ACT_W_DEAD (0.118 rad/s) does not turn the wheels at all, so the
-# proportional tail -- 2.5 * err / need of full speed -- has a fixed point: it decelerates into
-# the deadband while still outside the release tolerance, and then sits there until the deadline.
-# Measured on a -45 deg turn: released at 42.96/45.00 deg (tolerance 1.8 deg, deadband floor
-# 4.7% of the target = 2.1 deg) and burned the whole 15 s doing nothing. Turns floor here instead.
-TURN_MIN = 0.20                    # rad/s commanded, ~3.5 deg/s delivered, above the deadband
+# The proportional tail -- 2.5 * err / need of full speed -- has a fixed point if it can decelerate
+# below what the wheels execute: measured on a -45 deg turn, released at 42.96/45.00 deg (tolerance
+# 1.8 deg) and burned the whole 15 s deadline doing nothing. nav.achieved() predicts 2.12 deg of
+# stuck error for that deadband, which is the 2.04 deg the car actually stopped short by -- the
+# arithmetic and the bench agree, so turns floor at nav.turn_floor() instead of crawling into it.
 # Stall watchdog for a single-step Move. Before this, the only answer a blocked car had was the
 # --move-timeout deadline: it kept pushing into the thing for 15 s and then handed the model the
 # sentence "可能打滑或被挡住", i.e. the diagnosis was delegated to a guess. The tests below are
@@ -130,10 +130,10 @@ def tail_cmd(kind, speed, err, need):
     """The command the closed loop uses when it is closing on its target.
 
     Proportional to the remaining error, but never below what the chassis will execute: a turn
-    command under nav.ACT_W_DEAD is a command to stand still, which used to park the loop in a
+    command under the executed band is a command to stand still, which used to park the loop in a
     fixed point ~2 deg short of a 45 deg turn until the deadline expired.
     """
-    crawl = 0.06 if kind == "linear" else TURN_MIN
+    crawl = 0.06 if kind == "linear" else nav.turn_floor()
     return min(speed, max(crawl, speed * min(1.0, err / max(need, 1e-6) * 2.5)))
 
 _JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
@@ -851,7 +851,13 @@ class Car(Node):
             err = wrap_pi(cur[2] - yaw0)
         if abs(err) <= HOLD_DEAD:
             return 0.0, abs(err)
-        mag = min(HOLD_MAX, max(HOLD_MIN, HOLD_KP * abs(err)))
+        floor = max(HOLD_MIN, nav.turn_floor())
+        if floor > HOLD_MAX:
+            # The whole band the chassis obeys is now wider than a hold is allowed to be: a
+            # stronger correction would fight the straight line it is supposed to keep, and a
+            # weaker one is a command to stand still. Say nothing rather than pretend.
+            return 0.0, abs(err)
+        mag = min(HOLD_MAX, max(floor, HOLD_KP * abs(err)))
         return (-mag if err > 0.0 else mag), abs(err)
 
     def _coast_lead(self, need):

@@ -136,6 +136,29 @@ fails += [not check("achieved ccw +0.50", nav.achieved(0.0, 0.50)[1], 0.30),
           not check("achieved ccw +0.20 (over dead)", nav.achieved(0.0, 0.20)[1], 0.06),
           not check("achieved ccw +0.10 (under dead)", nav.achieved(0.0, 0.10)[1], 0.0)]
 
+# The fitted dead zone is the least-squares line's zero; the bench found the wheels stop earlier
+# than that line says, so the model has a measured floor of its own (2026-10-19: wz=0.08 delivered
+# 0.000 on both signs, 0.12 was the lowest command that moved).
+nav.ACT_W_DEAD = nav.ACT_W_DEAD_NEG = 0.02          # a fit that extrapolates a tiny deadband
+fails += [not check("cut-on overrides a small fitted dead",
+                    nav.achieved(0.0, nav.ACT_W_CUTON * 0.99)[1], 0.0),
+          not check("cut-on overrides it cw too",
+                    nav.achieved(0.0, -nav.ACT_W_CUTON * 0.99)[1], 0.0),
+          not check("above the cut-on the fit still answers",
+                    nav.achieved(0.0, nav.ACT_W_CUTON * 1.05)[1] > 0.0, True)]
+nav.ACT_W_DEAD, nav.ACT_W_DEAD_NEG = 0.125, 0.323
+fails += [not check("turn floor is 2.5x the fit when the fit is bigger",
+                    nav.turn_floor(), 2.5 * 0.323),
+          not check("turn floor never goes under the measured 0.15",
+                    nav.turn_floor() >= 0.15, True)]
+nav.ACT_W_DEAD, nav.ACT_W_DEAD_NEG = 0.05, 0.064
+fails += [not check("a small fit cannot drop the floor under 0.15", nav.turn_floor(), 0.15)]
+nav.ACT_W_DEAD, nav.ACT_W_DEAD_NEG = 0.064, 0.076        # the 2026-10-19 car
+fails += [not check("today's fit floors turns at 2.5x dead", nav.turn_floor(), 2.5 * 0.076),
+          not check("and that is above the measured cut-on",
+                    nav.turn_floor() > nav.ACT_W_CUTON, True)]
+nav.ACT_W_DEAD, nav.ACT_W_DEAD_NEG = 0.125, 0.323
+
 # voltage scale: gains yes, stiction no
 nav.ACT_VOLT_REF, nav.ACT_VOLTS = 12.0, 12.0
 base_v, base_w = nav.achieved(0.10, 0.50)

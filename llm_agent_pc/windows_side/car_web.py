@@ -1460,6 +1460,12 @@ class Console:
             "busy": busy, "mapping": self.mapping, "frames": self.world.frames,
             "occ": int((lo >= 0.65).sum()), "free": int((lo <= -2.0).sum()),
             "samples": len(self.samples), "gains": gains(),
+            # Derived, not fitted: the band the wheels ignore (nav.ACT_W_CUTON, measured) and the
+            # smallest turn command any loop will bother sending. Kept out of gains() so
+            # nav_gains.json only ever stores things a human might re-fit.
+            "chassis": {"cuton": nav.ACT_W_CUTON, "turn_floor": round(nav.turn_floor(), 3),
+                        "dead_eff": round(max(nav.ACT_W_DEAD, nav.ACT_W_CUTON), 3),
+                        "dead_eff_neg": round(max(nav.ACT_W_DEAD_NEG, nav.ACT_W_CUTON), 3)},
             "caps": {"v": CAP_V, "w": CAP_W}, "tour": bool(self.tour),
             "cam": ("http://%s:%d/stream" % (self.args.camera_ip, self.args.camera_port)
                     if self.args.camera_ip else ""),

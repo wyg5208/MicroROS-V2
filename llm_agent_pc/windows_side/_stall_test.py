@@ -74,6 +74,18 @@ check("直行末档仍然用 0.06 m/s 的爬行档（没有线性死区，别改
       m.tail_cmd("linear", 0.25, 0.001, 0.3), 0.06)
 check("全速段不受影响", m.tail_cmd("angular", 1.0, math.radians(40.0), math.radians(45.0)), 1.0)
 
+# 末档命令与停滞判据必须互相兼容：下限若低于起转点，判据会把"车真的在爬"当成顶住不动；
+# 若下限太高，顶住不动的车每窗都能爬到 25% 的额度（odom 撒谎时更糟）。
+_floor = nav.turn_floor()
+_want = abs(nav.achieved(0.0, _floor)[1]) * m.STALL_SECS
+check("末档命令 %.2f rad/s 交付 %.2f°/s（高于起转点 %.2f）" % (
+      _floor, math.degrees(abs(nav.achieved(0.0, _floor)[1])), nav.ACT_W_CUTON),
+      abs(nav.achieved(0.0, _floor)[1]) > 0.0, True)
+check("末档正常爬速不许判成停滞",
+      m.stalled(_want, 0.6 * _want, m.STALL_SECS, "angular"), False)
+check("末档命令下顶住不动仍要判成停滞",
+      m.stalled(_want, 0.0, m.STALL_SECS, "angular"), True)
+
 # ---- 2. 真车日志回放 ---------------------------------------------------------
 print("\n== 真车录制回放（正常动作里会不会误报） ==")
 files = sys.argv[1:] or [f for f in ("_t36d_clean.txt", "_t35_clean.txt") if os.path.exists(f)]

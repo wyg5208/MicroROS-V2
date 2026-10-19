@@ -165,7 +165,7 @@ video,img{width:100%;border-radius:6px;background:#000;display:block}
       </div>
       <div class="row sp"><button id="fitBtn">从日志拟合控制参数</button>
         <button id="clearSamples">清空样本</button>
-        <span class="hint">样本 <b id="nsamp">0</b></span></div>
+        <span class="hint">样本 <b id="nsamp">0</b> · 起转下限 <b id="tfloor">-</b> rad/s</span></div>
       <div id="fit" class="hint" style="margin-top:6px;white-space:pre-wrap"></div>
       <div class="row" style="margin-top:8px">
         <label>增益v<input type="number" id="gv" step="0.01" style="width:58px"></label>
@@ -309,6 +309,9 @@ async function poll(){
       '。这段的位姿不可信，建图已跳过它折进来的帧。';
   }
   $('nsamp').textContent=st.samples;
+  // below this the wheels do not turn, so any fitted "deadband" smaller than this number is the
+  // straight line's zero, not the car's -- the floor loops actually use is max(0.15, 2.5*dead)
+  $('tfloor').textContent=(st.chassis&&st.chassis.turn_floor!=null)?st.chassis.turn_floor:'-';
   $('ptz').textContent=st.ptz[0].toFixed(0)+'°, '+st.ptz[1].toFixed(0)+'°';
   $('top').textContent='· 开机 '+Math.round(st.uptime)+' s';
   $('vcap').textContent=st.caps.v;$('wcap').textContent=st.caps.w;
