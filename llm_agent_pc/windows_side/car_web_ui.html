@@ -134,6 +134,17 @@ video,img{width:100%;border-radius:6px;background:#000;display:block}
     </div>
 
     <div class="pan" style="margin-top:10px">
+      <h2>地点</h2>
+      <div class="row">
+        <input type="text" id="placeLabel" maxlength="24" placeholder="给脚下起个名" style="width:132px">
+        <button id="placeAdd">记住这里</button>
+        <span class="hint" id="placeNote"></span>
+      </div>
+      <div id="places" class="hint" style="margin-top:6px">还没记过地点。</div>
+      <div class="hint" style="margin-top:4px">编号就是地图上的紫色点。清空地图会把这些一起忘掉。</div>
+    </div>
+
+    <div class="pan" style="margin-top:10px">
       <h2>云台</h2>
       <div class="row">
         <button data-ptz="-15,0">←</button><button data-ptz="15,0">→</button>
@@ -200,6 +211,7 @@ video,img{width:100%;border-radius:6px;background:#000;display:block}
 
 <script>
 const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
 const api=(p,body)=>fetch(p,body?{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify(body)}:{}).then(r=>r.json()).catch(e=>({error:''+e}));
 
@@ -219,7 +231,11 @@ async function tick(){
   if(sig!==lastSent||v||w){ lastSent=sig; await api('/api/teleop',{v:v, w:w, hold:0.35}); }
 }
 setInterval(tick,120);
-addEventListener('keydown',e=>{const k=KEYS[e.code];if(k&&!e.repeat){held.add(k);e.preventDefault();}});
+// Typing a place name into the new box used to drive the car: W/A/S/D and the arrows are bound on
+// the window, so every keystroke in every <input> was a joystick push. Any focused text field --
+// including one the browser is still composing Chinese in -- has to own its keys.
+const typing=e=>{const t=e.target;return t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable);};
+addEventListener('keydown',e=>{const k=KEYS[e.code];if(k&&!e.repeat&&!typing(e)){held.add(k);e.preventDefault();}});
 addEventListener('keyup',e=>{const k=KEYS[e.code];if(k)held.delete(k);});
 addEventListener('blur',()=>held.clear());
 document.addEventListener('visibilitychange',()=>{if(document.hidden)held.clear();});
@@ -308,6 +324,15 @@ async function poll(){
     $('lieMsg').textContent='轮子打滑：'+lieS.join('，')+
       '。这段的位姿不可信，建图已跳过它折进来的帧。';
   }
+  // The numbering is taken from state()["places"] as-is -- that array is built by enumerating the
+  // same list render_map stamps in magenta onto the picture, so "3" in this column and the "3" on
+  // the map are one object, not two sorts that happen to agree today.
+  const ps=st.places||[];
+  $('places').innerHTML=ps.length?ps.map(p=>'<div>'+p.n+'. <b>'+esc(p.label)+'</b> · '+
+    (p.dist==null?'距离未知':p.dist.toFixed(2)+' m')+' · 图 ('+sgn(p.map[0])+', '+sgn(p.map[1])+
+    ') m <button data-n="'+p.n+'">忘掉</button></div>').join('')
+    :'还没记过地点：把车开到那儿再按「记住这里」，或者让智能体 Remember。';
+  $('places')._list=ps;
   $('nsamp').textContent=st.samples;
   // below this the wheels do not turn, so any fitted "deadband" smaller than this number is the
   // straight line's zero, not the car's -- the floor loops actually use is max(0.15, 2.5*dead)
@@ -358,6 +383,25 @@ $('lidarOv').onclick=e=>{ovOn=!ovOn;e.target.classList.toggle('on',ovOn);};
 $('full').onclick=e=>{fullView=!fullView;e.target.classList.toggle('on',fullView);};
 $('home').onclick=()=>api('/api/origin',{});
 $('homeReset').onclick=()=>api('/api/origin',{reset:true});
+// One delegated listener, same reason as the reloc candidates: poll() rebuilds these buttons every
+// 600 ms, so a handler bound to a button would be discarded before the click landed.
+let noteT=0;
+function note(s){$('placeNote').textContent=s;clearTimeout(noteT);noteT=setTimeout(()=>$('placeNote').textContent='',9000);}
+$('places').onclick=(e)=>{
+  const b=e.target.closest('button');if(!b)return;
+  const p=($('places')._list||[]).find(x=>x.n===+b.dataset.n);if(!p)return;
+  api('/api/places',{forget:p.label}).then(r=>note(r.text||r.error||''));
+};
+function addPlace(){
+  const v=$('placeLabel').value.trim();
+  if(!v){note('先写个名字。');return;}
+  api('/api/places',{label:v}).then(r=>{
+    note(r.text||r.error||'');
+    if(!r.error){$('placeLabel').value='';poll();}
+  });
+}
+$('placeAdd').onclick=addPlace;
+$('placeLabel').onkeydown=e=>{if(e.key==='Enter')addPlace();};
 $('axes').onclick=e=>{axOn=!axOn;e.target.classList.toggle('on',axOn);};
 $('view').onclick=e=>{view=view==='odom'?'car':'odom';
   e.target.textContent=view==='odom'?'原点居中':'车头居中';

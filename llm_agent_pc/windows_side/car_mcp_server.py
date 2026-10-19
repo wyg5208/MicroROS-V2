@@ -1520,14 +1520,37 @@ def build_server(car, args):
         "The car's global self-impression: where it sits inside the map it built, how much of "
         "the map is still unmeasured and in which direction (nearest frontier plus a 12-sector "
         "histogram of the unknown), how well the lidar agrees with the claimed pose right now, "
-        "what the drift suppressor has spent, and whether exploration is finished. Read-only and "
-        "safe during a running Tour. Call this before deciding where to go next -- it answers "
-        "'what is left to see' in a way ScanRing/CheckAhead (local lidar only) never can."))
+        "what the drift suppressor has spent, **which places a human has asked it to remember "
+        "(with distance and bearing -- this is where 'where is the sofa' is answered)**, and "
+        "whether exploration is finished. Read-only and safe during a running Tour. Call this "
+        "before deciding where to go next -- it answers 'what is left to see' and 'what do I "
+        "know about this room' in a way ScanRing/CheckAhead (local lidar only) never can."))
     def MapInfo() -> str:
         con = getattr(car, "console", None)
         if con is None:
             return "全局地图活在网页控制台里，而它没启动（--web-port 0）：没有可查的图。"
         return con.map_view()
+
+    @mcp.tool(description=(
+        "Pin a word to where the car stands right now -- 'this is the sofa', '充电座', "
+        "'客厅中间'. The label is stored in the map's own frame, so it survives a bridge "
+        "restart and shows up in MapInfo (and as a numbered dot on the console map). "
+        "Say it again with the same label to move it. It is deleted together with 清空地图, "
+        "because a new map is a different frame. Read-only: it never touches the motors."))
+    def Remember(label: str) -> str:
+        con = getattr(car, "console", None)
+        if con is None:
+            return "控制台没启动，没有地方存这个标签。"
+        return con.add_place(label)
+
+    @mcp.tool(description=(
+        "Drop a remembered label (exact name, or a 2+ character word inside it matches). "
+        "Use it when a human says that note is wrong or no longer applies. Read-only."))
+    def Forget(label: str) -> str:
+        con = getattr(car, "console", None)
+        if con is None:
+            return "控制台没启动，本来也没记住任何东西。"
+        return con.del_place(label)
 
     @mcp.tool(description="Play a beep on the buzzer for the given duration in ms.")
     def Beep(duration_ms: int = 200) -> str:

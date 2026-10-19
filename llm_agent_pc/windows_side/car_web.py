@@ -26,8 +26,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
 import nav
-from car_mcp_server import (PTZ_PITCH_LIMIT, PTZ_SERVO_PITCH_LEVEL, PTZ_SERVO_YAW_CENTRE,
-                            PTZ_YAW_LIMIT, grab_jpeg)
+from car_mcp_server import (ODOM_TOPIC, PTZ_PITCH_LIMIT, PTZ_SERVO_PITCH_LEVEL,
+                            PTZ_SERVO_YAW_CENTRE, PTZ_YAW_LIMIT, grab_jpeg)
 from geometry_msgs.msg import Vector3
 from std_msgs.msg import UInt16
 
@@ -40,6 +40,8 @@ CALIB_FILE = os.path.join(HERE, "calib_samples.jsonl")
 
 CAP_V = 0.25            # console limits, m/s and rad/s
 CAP_W = 0.90
+PLACE_MAX = 40          # remembered labels; beyond this Forget first -- the map_view line has
+PLACE_LABEL_MAX = 24    # to stay readable for a 9B model, and a label longer than this is a note
 TELEOP_HOLD = 0.35      # s a teleop command survives without a refresh
 STREAM_DT = 0.05        # the board wants a continuous cmd_vel stream at this period
 
@@ -193,6 +195,10 @@ AX_GRID = (30, 34, 38)        # darkened grid lines
 AX_ZERO = (255, 92, 160)      # the x=0 / y=0 odom axes
 AX_NUM = (255, 210, 60)       # tick numbers
 AX_BG = (12, 15, 19)
+# Remembered places. Not the old magenta (255,90,200): against AX_ZERO's pink (255,92,160) a dot
+# and an axis line are the same colour to the eye, and the first live map showed exactly that
+# confusion -- the pink cross looked like it belonged to the two notes pinned under the car.
+PLACE_COL = (170, 70, 255)
 
 
 def ax_text(img, x, y, s, col, sc=2):
@@ -351,6 +357,11 @@ class Console:
                                        "cache_console", "grid.npy")
         self.origin_file = os.path.join(os.path.dirname(self.cache_file), "origin.json")
         self.bias_file = os.path.join(os.path.dirname(self.cache_file), "bias.json")
+        # Remembered places live in the same frame as the grid (pose = odom + bias), which is
+        # why 清空地图 must delete them together with it: a wall-less blank grid is a new frame,
+        # and "the sofa is 1.5 m left" carried over would be a coordinate from another room.
+        self.places_file = os.path.join(os.path.dirname(self.cache_file), "places.json")
+        self.places = []
         self.last_save = 0.0
         self.tour = None
         self.started = time.monotonic()
@@ -360,6 +371,7 @@ class Console:
         except OSError:
             pass
         self._load_grid()
+        self._load_places()
         self._load_samples()
 
     # ---------------------------------------------------------------- log ----
@@ -1262,12 +1274,19 @@ class Console:
         if self.car.bias != (0.0, 0.0):
             self.car.set_bias(0.0, 0.0)
             self.reloc["bias"] = [0.0, 0.0]
-        for f in (self.cache_file, self.bias_file):
+        for f in (self.cache_file, self.bias_file, self.places_file):
             try:
                 os.remove(f)
             except OSError:
                 pass
-        self.push("地图已清空，重新开始建图（重定位修正一并归零）", "map")
+        # A new grid is a new frame, so words pinned to the old one are not "stale", they are
+        # coordinates belonging to a room that no longer exists here.
+        with self.lock:
+            had = len(self.places)
+            self.places = []
+            self.map_cache = {}
+        self.push("地图已清空，重新开始建图（重定位修正一并归零%s）"
+                  % ("，并忘掉 %d 个地点" % had if had else ""), "map")
 
     def _load_grid(self):
         """Re-seed the map from the last session: restarting the bridge used to throw away
@@ -1315,6 +1334,82 @@ class Console:
                 json.dump(list(self.origin), fh)
         except OSError:
             pass
+
+    # ------------------------------------------------------- places (语义记忆) ----
+    def _load_places(self):
+        try:
+            with open(self.places_file, encoding="utf-8") as fh:
+                rows = json.load(fh)
+            self.places = [{"label": str(r["label"])[:PLACE_LABEL_MAX],
+                            "x": float(r["x"]), "y": float(r["y"]),
+                            "yaw": float(r.get("yaw", 0.0))}
+                           for r in rows if isinstance(r, dict) and r.get("label")]
+        except Exception:
+            self.places = []
+
+    def _save_places(self):
+        try:
+            with open(self.places_file, "w", encoding="utf-8") as fh:
+                json.dump(self.places, fh, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def add_place(self, label):
+        """Anchor a word to where the car stands now, in the grid's own frame."""
+        label = (label or "").strip()[:PLACE_LABEL_MAX]
+        if not label:
+            return "空的标签，没记。"
+        with self.car.lock:
+            pose = self.car.pose
+        if pose is None:
+            return "位姿还没有（%s 从未到过），不能把一个词钉到地图上。" % ODOM_TOPIC
+        x, y, yaw = pose[0], pose[1], pose[2]
+        with self.lock:
+            old = [p for p in self.places if p["label"] == label]
+            self.places = [p for p in self.places if p["label"] != label]
+            if len(self.places) >= PLACE_MAX:
+                return "已经记了 %d 个地点，先 Forget 掉没用的再记新的。" % PLACE_MAX
+            self.places.append({"label": label, "x": round(x, 3), "y": round(y, 3),
+                                "yaw": round(yaw, 3)})
+            self._save_places()
+            self.map_cache = {}             # the picture now has one more mark on it
+        self.push("记住「%s」在地图 (%+.2f, %+.2f) m%s" % (
+            label, x, y, "（覆盖旧的）" if old else ""), "map")
+        return "已记「%s」= 地图 (%+.2f, %+.2f) m。它会和这张图一起存在，清空地图时一并删除。" % (
+            label, x, y)
+
+    def del_place(self, label):
+        label = (label or "").strip()
+        with self.lock:
+            hit = [p for p in self.places if p["label"] == label] or (
+                [p for p in self.places if label and label in p["label"]] if len(label) >= 2 else [])
+            if not hit:
+                return "没找到「%s」。现在记着：%s" % (
+                    label, "、".join(p["label"] for p in self.places) or "一个都没有")
+            self.places = [p for p in self.places if p not in hit]
+            self._save_places()
+            self.map_cache = {}
+        self.push("已忘记 %d 个地点：%s" % (len(hit), "、".join(p["label"] for p in hit)), "map")
+        return "已忘记「%s」（剩下 %d 个）" % ("」「".join(p["label"] for p in hit), len(self.places))
+
+    def places_near(self, pose, limit=4):
+        """Remembered places ordered by distance, with body-frame bearing (正=向左) -- the same
+        convention Move speaks, so the model can act on the answer without converting."""
+        if pose is None or not self.places:
+            return []
+        rows = []
+        with self.lock:
+            items = list(self.places)
+        ox, oy = self.origin
+        for p in items:
+            dx, dy = p["x"] - pose[0], p["y"] - pose[1]
+            rng = math.hypot(dx, dy)
+            rel = math.degrees(math.atan2(dy, dx) - pose[2])
+            rows.append({"label": p["label"], "dist": round(rng, 2),
+                         "bearing": round((rel + 180.0) % 360.0 - 180.0, 0),
+                         "map": [round(p["x"] - ox, 2), round(p["y"] - oy, 2)]})
+        rows.sort(key=lambda r: r["dist"])
+        return rows[:limit]
 
     def _save_grid(self):
         now = time.monotonic()
@@ -1416,6 +1511,16 @@ class Console:
                        "每 30° 一格、从正后开始逆时针：%s（第 %d 格是正前）"
                        % (f["frontier"], f["nearest"], f["bearing"], centre, hist[top],
                           " ".join(str(h) for h in hist), len(hist) // 2))
+        near = self.places_near(pose)
+        if near:
+            out.append("记住的地点（共 %d 个，按远近）：%s；问「XX 在哪」就答这个，"
+                       "要说新地点用 Remember，说不要了用 Forget"
+                       % (len(self.places), "，".join(
+                           "「%s」%.1f m %+.0f°（显示系 %.2f, %.2f）"
+                           % (r["label"], r["dist"], r["bearing"], r["map"][0], r["map"][1])
+                           for r in near)))
+        elif self.places:
+            out.append("记住的地点：%d 个，但都不在当前位姿的可见范围内。" % len(self.places))
         out.append("电机：%s" % (("被 %s 占用" % busy) if busy else
                                 ("巡游中" if touring else "空闲")))
         return "\n".join(out)
@@ -1437,6 +1542,14 @@ class Console:
         # or clearing the map moves the bias without the suppressor being involved at all, and a
         # stale number here would report corrections that no longer exist.
         dd["bias"] = rl["bias"]
+        with self.lock:
+            spots = list(self.places)
+        # Numbered in exactly the order render_map stamps onto the picture, so the list beside
+        # the map and the magenta dots in it are the same objects, not two guesses.
+        places = [{"n": i + 1, "label": sp["label"],
+                   "map": [round(sp["x"] - ox, 2), round(sp["y"] - oy, 2)],
+                   "dist": None if p is None else round(math.hypot(sp["x"] - p[0], sp["y"] - p[1]), 2)}
+                  for i, sp in enumerate(spots)]
         return {
             "pose": None if p is None else [round(p[0] - ox, 3), round(p[1] - oy, 3),
                                             round(math.degrees(p[2]), 1)],
@@ -1473,6 +1586,7 @@ class Console:
                         "dead_eff": round(max(nav.ACT_W_DEAD, nav.ACT_W_CUTON), 3),
                         "dead_eff_neg": round(max(nav.ACT_W_DEAD_NEG, nav.ACT_W_CUTON), 3)},
             "caps": {"v": CAP_V, "w": CAP_W}, "tour": bool(self.tour),
+            "places": places,
             "cam": ("http://%s:%d/stream" % (self.args.camera_ip, self.args.camera_port)
                     if self.args.camera_ip else ""),
             "log": list(self.log)[:40], "uptime": round(time.monotonic() - self.started, 1),
@@ -1635,10 +1749,27 @@ class Console:
             if 0 <= r < img.shape[0] and 0 <= c < img.shape[1]:
                 img[r, c] = (255, 210, 0)
             t += res / 4.0
+        with self.lock:
+            spots = list(self.places)
+        # Places go under the car marker on purpose: a note pinned to the spot the car is
+        # standing on is the common case, and it must not erase "where am I".
+        for p in spots:
+            put(p["x"], p["y"], PLACE_COL, 2)
         put(pose[0], pose[1], (235, 60, 60), 3)
         up = np.repeat(np.repeat(img, 3, axis=0), 3, axis=1)
         if axes:
             draw_axes(up, ox, oy, res, c0, r1, dpose, (odx, ody))
+        # Number each dot the same way state()["places"] and map_view enumerate them, so the
+        # list beside the picture, the sentence the model reads out, and the pixels agree.
+        mpp3 = res / 3.0
+        x_min3, y_top3 = ox + c0 * res - odx, oy + r1 * res - ody
+        for i, p in enumerate(spots):
+            px = int(round((p["x"] - odx - x_min3) / mpp3))
+            py = int(round((y_top3 - (p["y"] - ody)) / mpp3))
+            if 0 <= px < up.shape[1] and 0 <= py < up.shape[0]:
+                ax_text(up, min(max(0, px - 6), up.shape[1] - 8),
+                        min(max(0, py - 14), up.shape[0] - 10),
+                        str(i + 1), PLACE_COL, 2)
         # Everything a viewer needs to place its own marks is published in the printed frame,
         # so an overlay and the picture it sits on can never disagree about where zero is.
         self.map_geom = {"x_min": ox + c0 * res - odx, "y_max": oy + r1 * res - ody,
@@ -1957,6 +2088,14 @@ def serve(car, args, console=None):
                 elif path == "/api/beep":
                     self._send(200, json.dumps({"text": outer.beep(b.get("ms", 200))},
                                                ensure_ascii=False))
+                elif path == "/api/places":
+                    # The same two tools the model calls, on a button: a human standing in the
+                    # room is better at naming things than any of the sensors.
+                    if b.get("forget") is not None:
+                        txt = outer.del_place(str(b.get("forget")))
+                    else:
+                        txt = outer.add_place(str(b.get("label", "")))
+                    self._send(200, json.dumps({"text": txt}, ensure_ascii=False))
                 else:
                     self._send(404, "{}")
             except BrokenPipeError:
