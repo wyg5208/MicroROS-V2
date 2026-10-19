@@ -34,6 +34,9 @@ from std_msgs.msg import UInt16
 HERE = os.path.dirname(os.path.abspath(__file__))
 GAINS_FILE = os.path.join(HERE, "nav_gains.json")
 FEEDBACK_FILE = os.path.join(HERE, "feedback_log.jsonl")
+# One line per measured burst, so a restart between two calibration sessions does not throw
+# away the long sweeps -- see Console._add_sample.
+CALIB_FILE = os.path.join(HERE, "calib_samples.jsonl")
 
 CAP_V = 0.25            # console limits, m/s and rad/s
 CAP_W = 0.90
@@ -305,7 +308,7 @@ class Console:
         self.mapping = True
         self.trail = deque(maxlen=4000)
         self.log = deque(maxlen=500)
-        self.samples = deque(maxlen=4000)  # (v_cmd, w_cmd, v_act, w_act, dt, src)
+        self.samples = deque(maxlen=4000)  # (v_cmd, w_cmd, v_act, w_act, dt, src, volts)
         self.origin = (0.0, 0.0)            # display-frame translation, see /api/origin
         self.map_cache = {}                # (half, lidar) -> (png, monotonic)
         self.map_geom = None               # world->pixel affine of the last rendered map
@@ -357,6 +360,7 @@ class Console:
         except OSError:
             pass
         self._load_grid()
+        self._load_samples()
 
     # ---------------------------------------------------------------- log ----
     def push(self, text, kind="info"):
@@ -466,7 +470,7 @@ class Console:
             return
         v_act = b["along"] / dt
         w_act = b["yaw"] / dt
-        self.samples.append((b["v"], b["w"], v_act, w_act, dt, "teleop"))
+        self._add_sample(b["v"], b["w"], v_act, w_act, dt, "teleop")
         if abs(b["v"]) > 0.02 or abs(b["w"]) > 0.05:
             self.push("点动 %.1f s：指令 v=%.2f w=%.2f → 实测 v=%.3f w=%.3f"
                       % (dt, b["v"], b["w"], v_act, w_act), "meas")
@@ -476,10 +480,67 @@ class Console:
         """Feed a calibration burst into the same sample log the teleop stream writes to."""
         if not c or c["dt"] <= 0:
             return
-        self.samples.append((c["v"], c["w"], c["v_act"], c["w_act"], c["dt"], "calib"))
+        self._add_sample(c["v"], c["w"], c["v_act"], c["w_act"], c["dt"], "calib")
         self.push("校正 %.1f s：指令 v=%.2f w=%.2f → 里程计 v=%.3f w=%.3f%s"
                   % (c["dt"], c["v"], c["w"], c["v_act"], c["w_act"],
                      ("，陀螺仪 w=%.3f" % c["gyro_w"]) if c.get("gyro_n") else ""), "meas")
+
+    def _add_sample(self, v, w, v_act, w_act, dt, src):
+        """Record one measured burst in the pool the fit reads, and on disk.
+
+        The pool used to be memory-only: restarting the bridge between two calibration sessions
+        silently dropped every 6-8 s sweep, and the next fit was left with only the teleop taps
+        (which the duration gate then rejects, so the honest answer became "no samples").
+        The pack voltage at sampling time rides along because the gains are a function of it.
+        """
+        volts = self.car.volts
+        self.samples.append((v, w, v_act, w_act, dt, src, volts))
+        try:
+            with open(CALIB_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps([round(v, 4), round(w, 4), round(v_act, 4), round(w_act, 4),
+                                    round(dt, 2), src,
+                                    None if volts is None else round(float(volts), 2)]) + "\n")
+        except OSError:
+            pass
+
+    def _load_samples(self):
+        """Refill the pool from calib_samples.jsonl -- the newest SAMPLE_CAP rows win."""
+        if not os.path.exists(CALIB_FILE):
+            return 0
+        try:
+            with open(CALIB_FILE, encoding="utf-8") as f:
+                lines = f.read().splitlines()[-SAMPLE_CAP:]
+        except OSError:
+            return 0
+        n = 0
+        for ln in lines:
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if not isinstance(r, list) or len(r) < 6 or r[4] is None:
+                continue
+            self.samples.append(tuple(r[:6]) + (r[6] if len(r) > 6 else None,))
+            n += 1
+        if n:
+            self.push("已恢复 %d 条历史校正样本（%s）" % (n, os.path.basename(CALIB_FILE)), "meas")
+        return n
+
+    def clear_samples(self):
+        """Empty the fit pool and its file copy.
+
+        Samples are only comparable with each other if the chassis was in the same state -- after
+        a firmware odom re-scale (VELOCITY_SCALE) or a motor/battery swap the old rows measure a
+        different car, and pooling them is worse than having nothing to fit.
+        """
+        n = len(self.samples)
+        self.samples.clear()
+        try:
+            open(CALIB_FILE, "w", encoding="utf-8").close()
+        except OSError:
+            pass
+        self.push("已清空 %d 条校正样本，拟合池现在是空的" % n, "gain")
+        return {"cleared": n, "left": len(self.samples)}
 
     # ------------------------------------------------------------- mapping ----
     def _fold(self):
@@ -1634,11 +1695,15 @@ class Console:
             out.update(ccw)
             out.update(cw)
         out["current"] = gains()
-        # what the pack read while these samples were taken -- the reference the voltage
-        # scale is measured against, and the box in the UI should hold it, not the default
-        out["volt_ref_now"] = self.car.volts
+        # The voltage the samples were taken at, not the voltage right now: the pool can be
+        # refilled from disk hours later (see _load_samples), and "now" would then anchor the
+        # volt scale to a pack reading that has nothing to do with these rows.
+        vols = [c[6] for c in keep if len(c) > 6 and c[6]]
+        ref = round(sum(vols) / len(vols), 2) if vols else self.car.volts
+        out["volt_ref_now"] = ref
+        out["volt_n"] = len(vols)
         if apply:
-            out["volt_ref"] = self.car.volts
+            out["volt_ref"] = ref
             out["applied"] = apply_gains(out)
             self.push("已按 %d 条直线 + %d 条转向样本（CCW %d / CW %d，%s）套用拟合增益"
                       " v=%.3f 左 gain=%.3f 偏置=%.3f 死区=%.3f 右 gain=%.3f 偏置=%.3f"
@@ -1691,6 +1756,9 @@ ANG_MIN_SIDE = 3
 
 # Shortest burst (s) that counts as a measurement of the steady response -- see Console.fit.
 FIT_MIN_DT = 2.5
+
+# Rows of calib_samples.jsonl to read back at startup (the deque holds the same amount).
+SAMPLE_CAP = 4000
 
 
 def apply_gains(vals):
@@ -1869,6 +1937,8 @@ def serve(car, args, console=None):
                     self._send(200, json.dumps(apply_gains(b)))
                 elif path == "/api/fit":
                     self._send(200, json.dumps(outer.fit(bool(b.get("apply")))))
+                elif path == "/api/calib_clear":
+                    self._send(200, json.dumps(outer.clear_samples()))
                 elif path == "/api/feedback":
                     outer.record_feedback(b.get("note", ""), b.get("truth"))
                     self._send(200, '{"ok":true}')

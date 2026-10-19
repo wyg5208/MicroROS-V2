@@ -164,6 +164,7 @@ video,img{width:100%;border-radius:6px;background:#000;display:block}
         <span class="hint">左右各测满 3 次，拟合才会给左右分别出价</span>
       </div>
       <div class="row sp"><button id="fitBtn">从日志拟合控制参数</button>
+        <button id="clearSamples">清空样本</button>
         <span class="hint">样本 <b id="nsamp">0</b></span></div>
       <div id="fit" class="hint" style="margin-top:6px;white-space:pre-wrap"></div>
       <div class="row" style="margin-top:8px">
@@ -459,7 +460,8 @@ $('fitBtn').onclick=async()=>{
     ' 右死区='+(r.w_dead_neg??'-')+
     '\n残差 rmse v='+(r.v_rmse??'-')+' 左w='+(r.w_rmse??'-')+' 右w='+(r.w_rmse_neg??'-')+
     '\n当前：v='+r.current.gain_v+' 左w='+r.current.gain_w+' 右w='+r.current.gain_w_neg+
-    ' 基准电压='+r.current.volt_ref+'（这批样本采样时 '+(r.volt_ref_now??'-')+' V）';
+    ' 基准电压='+r.current.volt_ref+'（这批样本采样时 '+(r.volt_ref_now??'-')+' V，'
+    +(r.volt_n??0)+' 条记了电压）';
   if(r.gain_v!=null)$('gv').value=r.gain_v;
   if(r.volt_ref_now)$('vr').value=r.volt_ref_now;
   if(r.gain_w!=null){$('gw').value=r.gain_w;$('wd').value=r.w_dead;$('wb').value=r.w_bias;}
@@ -468,6 +470,14 @@ $('fitBtn').onclick=async()=>{
   // focus one of the boxes so the 600 ms poll stops overwriting the row we just filled;
   // without this the fitted voltage is gone again before 保存并生效 is clicked
   $('vr').focus();
+};
+$('clearSamples').onclick=async()=>{
+  // no confirm step: the pool is rebuildable by driving, and this page's rule is that steps run
+  // directly -- but the count that vanished is printed, so it is never a silent loss
+  const r=await api('/api/calib_clear',{});
+  $('fit').textContent='已清空 '+(r.cleared??0)+' 条样本（磁盘上的 calib_samples.jsonl 一起清）\n'
+    +$('fit').textContent;
+  $('nsamp').textContent=(r.left??0);
 };
 $('saveGains').onclick=async()=>{
   const r=await api('/api/gains',{gain_v:+$('gv').value,volt_ref:+$('vr').value,

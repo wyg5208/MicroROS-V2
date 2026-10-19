@@ -83,6 +83,50 @@ fails += [not check("all-short pool has no linear", o4["n_linear"], 0, 0),
           not check("all-short pool has no angular", o4["n_angular"], 0, 0),
           not check("all-short pool makes no claim", "gain_w" in o4, False)]
 
+# ------------------------------------------------------- sample persistence ----
+import os  # noqa: E402
+import tempfile  # noqa: E402
+
+car_web.CALIB_FILE = os.path.join(tempfile.mkdtemp(), "calib_samples.jsonl")
+
+
+def cons(volts=None):
+    """A Console-shaped object with just the sample methods bound, like fake() does for fit."""
+    ns = fake([])
+    ns.car.volts = volts
+    for name in ("_add_sample", "_load_samples", "clear_samples"):
+        setattr(ns, name, getattr(car_web.Console, name).__get__(ns))
+    return ns
+
+
+# The pool used to be memory-only: restarting the bridge threw away every long sweep.
+w1 = cons(12.40)
+for w in (0.15, 0.30, 0.50, 0.70):
+    w1._add_sample(0.0, w, 0.0, 0.8 * w - 0.05, 6.0, "calib")
+w1._add_sample(0.12, 0.0, 0.111, 0.0, 7.0, "teleop")
+fails += [not check("every burst lands on disk", sum(1 for _ in open(car_web.CALIB_FILE)), 5, 0)]
+
+w2 = cons()
+fails += [not check("a fresh process refills from disk", w2._load_samples(), 5, 0)]
+o5 = car_web.Console.fit(w2, apply=False)
+fails += [not check("refilled pool still fits", o5["n_ccw"] + o5["n_cw"] + o5["n_linear"], 5, 0)]
+# volt_ref must follow the samples, not the wall clock: these rows were taken at 12.40 V and the
+# (simulated) new process has no reading yet.
+fails += [not check("volt_ref follows the samples", o5["volt_ref_now"], 12.40, 0.01),
+          not check("voltage-carrying rows counted", o5["volt_n"], 5, 0)]
+
+# a row from the older 6-field format must load and must not be counted as a voltage reading
+with open(car_web.CALIB_FILE, "a", encoding="utf-8") as f:
+    f.write(json.dumps([0.0, 0.5, 0.0, 0.35, 6.0, "calib"]) + "\n")
+w3 = cons()
+fails += [not check("legacy 6-field row loads", w3._load_samples(), 6, 0)]
+o6 = car_web.Console.fit(w3, apply=False)
+fails += [not check("legacy row keeps the volt mean honest", o6["volt_n"], 5, 0)]
+
+c = w3.clear_samples()
+fails += [not check("clear empties memory", c["left"], 0, 0),
+          not check("clear empties disk", sum(1 for _ in open(car_web.CALIB_FILE)), 0, 0)]
+
 # achieved() sign selection: each half has to use its own gain, bias and dead zone
 nav.ACT_GAIN_W, nav.ACT_W_BIAS, nav.ACT_W_DEAD = 0.80, 0.10, 0.125
 nav.ACT_GAIN_W_NEG, nav.ACT_W_BIAS_NEG, nav.ACT_W_DEAD_NEG = 0.62, 0.20, 0.323

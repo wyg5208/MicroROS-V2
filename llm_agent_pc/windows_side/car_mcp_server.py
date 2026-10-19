@@ -736,6 +736,15 @@ class Car(Node):
         with self.lock:
             prev = self.pose[2]
             prev_imu = None if self.imu is None else (self.imu[0], self.imu[1])
+        con = getattr(self, "console", None)
+        was_mapping = con.mapping if con else None
+        if con:
+            # Folding a scan during an open-loop sweep is the worst case for the map: the turn is
+            # exactly where the odometry's yaw is known to be wrong (overshoot, coast), and every
+            # degree of that error pastes a wall somewhere it never was. Two 6.5 s bursts at
+            # 0.35 rad/s grew the saved grid from 615 occupied cells to 2066, with a fan of ghost
+            # walls around the car, and the map still "matched" at 98% -- self-consistent wrong.
+            con.mapping = False
         try:
             while time.monotonic() - t0 < seconds and rclpy.ok():
                 self.drive(vx, wz)
@@ -757,6 +766,8 @@ class Car(Node):
                     prev_imu = imu
         finally:
             self.stop_stream(0.5)
+            if con:
+                con.mapping = was_mapping
         dt = time.monotonic() - t0
         with self.lock:
             x1, y1 = self.pose[0], self.pose[1]
