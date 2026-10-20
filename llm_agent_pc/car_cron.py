@@ -21,11 +21,16 @@
       {"name": "晚间断头巡游", "at": "22:30", "days": [0, 1, 2, 3, 4],
        "prompt": "先看 MapInfo，把剩下的未测格用 Tour 走掉；每次 Move 不要超过 1.0 米，走三轮就停下汇报",
        "enabled": false, "min_volts": 11.5, "max_minutes": 10,
-       "grace_min": 120, "require_map": true, "min_agree": 0.80, "max_odom_age": 2.0}]}
+       "grace_min": 120, "require_map": true, "min_agree": 0.80, "max_odom_age": 2.0,
+       "max_distance": 0.8, "max_angle": 90}]}
 
 急停有两个，都不用碰这个脚本：`cron.pause` 文件一存在就**一班都不发**（连手动点火也挡着，
 恢复就是删掉它）；页面上那个"急停"仍能在动作中途把车掐停。另外每条任务有 `max_minutes`，
 到点由调度侧发 `POST :8020/stop` —— 上限是分钟数，不是模型自报的"我做完了"。
+
+最后那对 `max_distance` / `max_angle` 是**这一班的单次动作上限**：不写就沿用聊天页启动时的
+全局上限（`--max-distance 1.5 --max-angle 90`），写了只能往更小压，且发出去后要核对 :8020
+的回显 —— 回显对不上（多半是聊天页还在跑不认识这两个字段的旧版）就当场急停，不拿"我以为压住了"当证据。
 """
 import argparse
 import datetime as dt
@@ -43,10 +48,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # 默认值一律取保守的一侧：宁可少跑一班，也不要在车不在线、地图是空的、或者它自己都在怀疑位置的时候跑。
 DEFAULTS = {"min_volts": 11.5, "max_minutes": 10.0, "grace_min": 120,
             "require_map": True, "min_agree": 0.80, "max_odom_age": 2.0,
-            "days": None, "enabled": False}
+            "days": None, "enabled": False, "max_distance": None, "max_angle": None}
 TEMPLATE = {"tasks": [{"name": "晚间断头巡游", "at": "22:30", "days": [0, 1, 2, 3, 4],
                        "prompt": "先看 MapInfo，把剩下的未测格用 Tour 走掉；每次 Move 不要超过 1.0 米",
-                       "enabled": False}]}
+                       "max_distance": 1.0, "enabled": False}]}
 
 PATHS = {"dir": HERE}                      # --self-test 会把它挪进临时目录，别污染真状态
 
@@ -82,6 +87,15 @@ def load_tasks(path=None):
         if t["name"] in names:
             return out, "任务重名：%s（去重按名字记，重名会互相顶掉）" % t["name"]
         names.add(t["name"])
+        for key in ("max_distance", "max_angle"):
+            if t[key] is None:
+                continue
+            try:
+                t[key] = max(0.0, float(t[key]))
+            except (TypeError, ValueError):
+                # 写了就必须是数：把它当没写，发出去的那句话就拿全局上限跑，
+                # 而日志里还写着"这班压到 0.8 米"—— 那比不压更糟。
+                return out, "任务 %s 的 %s 不是数：%r（不写就留空，别写错的字）" % (t["name"], key, item.get(key))
         try:
             parse_at(t["at"])
         except ValueError as exc:
@@ -153,6 +167,34 @@ def due(task, now, rec):
     return True, {"date": day, "state": "fired"}, None
 
 
+def caps_note(task):
+    """日志里那句"这班把单次动作上限压到多少"；两个都没写就是空串（沿用服务端全局上限）。"""
+    p = []
+    if task["max_distance"] is not None:
+        p.append("%.2f 米" % task["max_distance"])
+    if task["max_angle"] is not None:
+        p.append("%.0f 度" % task["max_angle"])
+    return "、".join(p)
+
+
+def caps_applied(echo, max_distance, max_angle):
+    """服务器回显的那对数**不高于**请求值，才算这个上限真被接住了。
+
+    不采信"我发出去了"，只采信对面报回来的生效值 —— XML 那回就是脚本自认为自己改好了、
+    schtasks 一个字没应用（离线判据 7 条全过）。字段整个没有 = 聊天页跑的是旧版 car_chat.py，
+    那句话正拿全局上限跑着，一样算没生效。没请求上限时回显无所谓。
+    """
+    if not isinstance(echo, dict):
+        return False
+    for key, want in (("max_distance", max_distance), ("max_angle", max_angle)):
+        if want is None:
+            continue
+        got = echo.get(key)
+        if not isinstance(got, (int, float)) or isinstance(got, bool) or got > want + 1e-9:
+            return False
+    return True
+
+
 def preflight(task, chat, car, occ):
     """体检。字段名全部照 :8020/state 与 :8010/api/state 实测的那一套，不写代码里没读过的键。"""
     if chat is None:
@@ -218,12 +260,16 @@ def run_once(tasks, api, now, fired, dry=False, force=None):
             did.append((name, "blocked", why))
             continue
         if dry:
-            log("%s [dry-run] 体检全过，本该发这句：%s" % (name, task["prompt"]), now)
+            note = caps_note(task)
+            log("%s [dry-run] 体检全过，本该发这句%s：%s" % (
+                name, "（单次上限 " + note + "）" if note else "", task["prompt"]), now)
             did.append((name, "dry", []))
             continue
         turns0 = (chat or {}).get("turns", 0)
-        log("%s 触发（体检全过）：%s" % (name, task["prompt"]), now)
-        err = api.post_chat(task["prompt"])
+        note = caps_note(task)
+        log("%s 触发（体检全过%s）：%s" % (
+            name, "，单次上限 " + note if note else "", task["prompt"]), now)
+        err = api.post_chat(task["prompt"], task["max_distance"], task["max_angle"])
         if err:
             log("%s 发不出去：%s" % (name, err), now)
             fired[name] = {"date": now.strftime("%Y-%m-%d"), "state": "blocked", "reasons": [err]}
@@ -237,7 +283,7 @@ def run_once(tasks, api, now, fired, dry=False, force=None):
             name, state, info.get("used_s", 0), info.get("turns"),
             "：「%s」" % text[:120] if text else ""), now)
         write_last({"name": name, "at": now.strftime("%Y-%m-%d %H:%M:%S"), "state": state,
-                    "info": info, "said": text, "prompt": task["prompt"]})
+                    "caps": note, "info": info, "said": text, "prompt": task["prompt"]})
         did.append((name, state, info))
     save_fired(fired)
     return did
@@ -294,16 +340,20 @@ class HttpApi(object):
             return None
 
     def _post(self, url, obj):
+        """返回 (错误串或 None, 响应 JSON)。响应体以前是丢掉的，现在要拿它核对回显。"""
         req = urllib.request.Request(url, data=json.dumps(obj).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=15.0) as r:
-                r.read()
-            return None
+                raw = r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
-            return "HTTP %d：%s" % (exc.code, exc.read().decode("utf-8", "replace")[:120])
+            return "HTTP %d：%s" % (exc.code, exc.read().decode("utf-8", "replace")[:120]), None
         except (urllib.error.URLError, OSError) as exc:
-            return "%s: %s" % (type(exc).__name__, exc)
+            return "%s: %s" % (type(exc).__name__, exc), None
+        try:
+            return None, json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            return None, {}
 
     def chat_state(self):
         st = self._get(self.chat_url + "/state")
@@ -324,13 +374,29 @@ class HttpApi(object):
                 return ev.get("text") or ""
         return ""
 
-    def post_chat(self, text):
+    def post_chat(self, text, max_distance=None, max_angle=None):
         # confirm=False：无人值守不该留一张没人点的确认卡 —— 60 s 后它自己超时变拒绝，
         # 那一轮就只会拿着一串拒绝结束。硬上限换由 max_minutes + 急停 + 服务端 clamp 三处兜。
-        return self._post(self.chat_url + "/chat", {"text": text, "confirm": False})
+        # 这两个可选数就是第三处的旋钮：任务自己把单次位移压小，但只在回显对上时才算数。
+        body = {"text": text, "confirm": False}
+        if max_distance is not None:
+            body["max_distance"] = max_distance
+        if max_angle is not None:
+            body["max_angle"] = max_angle
+        err, echo = self._post(self.chat_url + "/chat", body)
+        if err:
+            return err
+        if not caps_applied(echo, max_distance, max_angle):
+            # 话已经发出去了，正拿全局上限跑着 —— 先掐停再解释，别等它跑完。
+            self.post_stop()
+            return ("单次上限没生效（要 %s，:8020 回显 %s）：已发急停。"
+                    "多半是聊天页还在跑不认识这两个字段的旧版 car_chat.py，重启它" % (
+                        caps_note({"max_distance": max_distance, "max_angle": max_angle}) or "没要求",
+                        json.dumps(echo, ensure_ascii=False)[:120]))
+        return None
 
     def post_stop(self):
-        return self._post(self.chat_url + "/stop", {})
+        return self._post(self.chat_url + "/stop", {})[0]
 
     def pause_exists(self):
         return os.path.exists(os.path.join(PATHS["dir"], "cron.pause"))
@@ -351,6 +417,7 @@ class FakeApi(object):
         self.busy_left = busy_turns
         self.left = None
         self.sent, self.stops, self.gets = [], 0, 0
+        self.sent_caps = []              # 每次 post_chat 带的那对逐轮上限，供判据核对
 
     def chat_state(self):
         self.gets += 1
@@ -370,8 +437,9 @@ class FakeApi(object):
     def last_text(self):
         return self.text or ""
 
-    def post_chat(self, text):
+    def post_chat(self, text, max_distance=None, max_angle=None):
         self.sent.append(text)
+        self.sent_caps.append((max_distance, max_angle))
         self.chat["busy"] = True
         self.left = self.busy_left
         return None
@@ -501,7 +569,7 @@ def self_test():
     ck("  但手动点火也要过体检（有人正在开车就别插队）",
        [run_once([task()], api, T, {}, force="T")[0][1], api.sent], ["blocked", []])
     api = FakeApi(chat={"busy": False, "turns": 0})
-    api.post_chat = lambda t: "HTTP 409：上一条指令还在执行"
+    api.post_chat = lambda *a: "HTTP 409：上一条指令还在执行"
     ck("发不出去要记 blocked 并说清原因", run_once([task()], api, T, {})[0][2],
        ["HTTP 409：上一条指令还在执行"])
     api = FakeApi(chat={"busy": False, "turns": 0})
@@ -563,6 +631,92 @@ def self_test():
     ck("两个 .bat 都是纯 ASCII（cmd.exe 按字节偏移读文件，多字节会咬断一行当命令跑）",
        [max((ord(c) for c in setup), default=0) < 128,
         max((ord(c) for c in teardown), default=0) < 128], [True, True])
+
+    # 11 逐轮动作上限：任务表里那个数得一路带到 :8020，而且**回显对上**才算生效。
+    ck("任务表没写就是 None（沿用服务端的天花板，不在这里另立一个默认数）",
+       [task()["max_distance"], task()["max_angle"]], [None, None])
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({"tasks": [{"name": "甲", "at": "07:00", "prompt": "x",
+                              "max_distance": "一点点"}]}, fh, ensure_ascii=False)
+    ck("写错成字直接报错，不许当没写（当没写 = 那句话拿全局上限跑，日志却写着压小过）",
+       "不是数" in (load_tasks(p)[1] or ""), True)
+    ck("caps_note 只把写了的那半句说出来",
+       [caps_note(task()), caps_note(task(max_distance=0.8)),
+        caps_note(task(max_distance=0.8, max_angle=45))], ["", "0.80 米", "0.80 米、45 度"])
+    for echo, d, a, want in (({"max_distance": 0.8, "max_angle": 45.0}, 0.8, 45, True),
+                             ({"max_distance": 0.5}, 0.8, None, True),
+                             ({}, 0.8, None, False),
+                             ({"max_distance": 1.5}, 0.8, None, False),
+                             ({"max_distance": None}, 0.8, None, False),
+                             (None, 0.8, None, False),
+                             ({}, None, None, True)):
+        ck("回显 %r 对要求 %s/%s -> %s" % (echo, d, a, want), caps_applied(echo, d, a), want)
+    api, fired = FakeApi(chat={"busy": False, "turns": 0}), {}
+    run_once([task(max_distance=0.8, max_angle=45)], api, T, fired, force="T")
+    ck("任务表里的数真的带上了这次 POST", api.sent_caps, [(0.8, 45)])
+    txt = open(os.path.join(PATHS["dir"], "_cron.log"), encoding="utf-8").read()
+    ck("  触发那行日志带上上限（不然事后只看日志，不知道这班是压着跑的）", "0.80 米、45 度" in txt, True)
+    ck("  _cron_last.json 也留一笔 caps",
+       json.load(open(os.path.join(PATHS["dir"], "_cron_last.json"), encoding="utf-8"))["caps"],
+       "0.80 米、45 度")
+    api = FakeApi(chat={"busy": False, "turns": 0})
+    api.post_chat = lambda *a: "单次上限没生效（要 0.80 米，:8020 回显 {}）：已发急停"
+    ck("  上限没生效 = 这班算发失败，记 blocked、不进等跑完的循环",
+       [run_once([task(max_distance=0.8)], api, T, {}, force="T")[0][1], api.stops],
+       ["post_failed", 0])
+    with open(os.path.join(HERE, "car_chat.py"), encoding="utf-8") as fh:
+        chat_src = fh.read()
+    ck("服务端回显的字段名和这边读的是同一对（两边各写各的，早晚会漂）",
+       ['"max_distance": dist' in chat_src, '"max_angle": ang' in chat_src], [True, True])
+
+    # 12 "回显对不上就当场急停"只能在真 HTTP 上证：假 api 里这条分支根本不会被走到。
+    import http.server
+    import threading
+    hits = {"stop": 0, "body": None}
+
+    class MockChat(http.server.BaseHTTPRequestHandler):
+        echo = {}
+
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if self.path == "/chat":
+                hits["body"] = json.loads(raw.decode("utf-8"))
+            if self.path == "/stop":
+                hits["stop"] += 1
+            out = dict(self.echo) if self.path == "/chat" else {"ok": True}
+            data = json.dumps(out).encode()
+            self.send_response(202 if self.path == "/chat" else 200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), MockChat)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d" % srv.server_address[1]
+    try:
+        api = HttpApi(chat=url, console=url)
+        MockChat.echo = {"ok": True, "max_distance": 0.8, "max_angle": 45.0}
+        ck("真发一次：回显对得上就正常返回，一发急停都不发",
+           [api.post_chat("去巡游", 0.8, 45), hits["stop"]], [None, 0])
+        ck("  上限走字段、原话一个字不混进 text（页面看到的就是任务表里那句）",
+           hits["body"], {"text": "去巡游", "confirm": False, "max_distance": 0.8, "max_angle": 45})
+        MockChat.echo = {"ok": True}          # 旧版 car_chat.py：不认识这两个字段
+        err = api.post_chat("去巡游", 0.8)
+        ck("回显没这对字段 = 没接住：话虽然发出去了，立刻补一发急停",
+           [hits["stop"], "没生效" in err, "重启它" in err], [1, True, True])
+        MockChat.echo = {"max_distance": 1.5}
+        ck("  回显比请求大（服务端压根没压）也一样判没生效",
+           [api.post_chat("去巡游", 0.8) is not None, hits["stop"]], [True, 2])
+        MockChat.echo = {}
+        ck("没要求上限时不看回显（老任务表一个字都不必改，行为和以前一样）",
+           [api.post_chat("去巡游"), hits["body"]],
+           [None, {"text": "去巡游", "confirm": False}])
+    finally:
+        srv.shutdown()
 
     print("\n%s" % ("SELF-TEST PASS" if not fails else "SELF-TEST FAIL：%s" % fails))
     return 1 if fails else 0

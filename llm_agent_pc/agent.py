@@ -280,16 +280,24 @@ def describe_image(cfg, image_path):
 
 
 def clamp_motion(cfg, name, args):
-    """硬上限：小模型给出夸张参数时截断，避免车跑飞。"""
+    """硬上限：小模型给出夸张参数时截断，避免车跑飞。
+
+    返回 (args, 截断说明)，说明为空表示一个字没改。**被压掉的那部分必须让模型看到**：
+    提示词里写的是进程启动时那对全局上限，而一轮可以带一个更小的逐轮上限（定时任务用），
+    不告诉它距离被截了，它就会按自己原本说的数汇报"往前走了 1.2 米"。
+    """
     if name != "Move":
-        return args
-    d = args.get("distance")
-    a = args.get("angle")
-    if isinstance(d, (int, float)):
-        args["distance"] = max(-cfg.max_distance, min(cfg.max_distance, d))
-    if isinstance(a, (int, float)):
-        args["angle"] = max(-cfg.max_angle, min(cfg.max_angle, a))
-    return args
+        return args, ""
+    notes = []
+    for key, cap in (("distance", abs(float(cfg.max_distance))),
+                     ("angle", abs(float(cfg.max_angle)))):
+        v = args.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            c = max(-cap, min(cap, v))
+            if c != v:
+                args[key] = c
+                notes.append("%s %s 压到 %s" % (key, v, c))
+    return args, "、".join(notes)
 
 
 def needs_confirm(cfg, name):
@@ -381,7 +389,7 @@ def run_turn(cfg, mcp, tools_spec, name_map, messages, user_text):
                 hooks.event({"type": "badargs", "step": step + 1, "tool": real, "text": result})
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
                 break
-            args = clamp_motion(cfg, real, args)
+            args, clamped = clamp_motion(cfg, real, args)
             hooks.event({"type": "call", "step": step + 1, "tool": real, "args": args})
             secs = 0.0
             if cfg.dry_run:
@@ -397,6 +405,10 @@ def run_turn(cfg, mcp, tools_spec, name_map, messages, user_text):
                 except McpError as exc:
                     result = f"MCP 调用异常: {exc}"
                 secs = time.monotonic() - t0
+            if clamped:
+                result += ("\n[已按单次动作上限截断：%s。本轮上限 %s 米 / %s 度，"
+                           "车上真的执行的是截断后的数，汇报时别再用你原本说的那个]" % (
+                               clamped, cfg.max_distance, cfg.max_angle))
             if cfg.vision_model and real in ("SeeWhat", "AdjustCameraView"):
                 hit = IMAGE_RE.search(result)
                 local = fetch_image(cfg, hit.group(1)) if hit else None

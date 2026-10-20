@@ -344,6 +344,13 @@ class Speaker:
         return {"ok": True, "was": "stopped"}
 
 
+def _num(v):
+    """请求体里的数：只认真数，负数当 0，不是数就当没给（返回 None）。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return max(0.0, float(v))
+
+
 class Session:
     """一条对话 + 一次只允许一个动作回合 + 一把要人点头的确认闸。"""
 
@@ -351,6 +358,9 @@ class Session:
         self.cfg, self.mcp = cfg, mcp
         self.tools_spec, self.name_map = tools_spec, name_map
         self.console, self.approve_timeout = console, approve_timeout
+        # 启动时那对 --max-distance/--max-angle 是**天花板**：逐轮上限只许往下压，
+        # 传个更大的数字不能把车放出界（网页和定时任务都是客人，不是房主）。
+        self.caps = (abs(float(cfg.max_distance)), abs(float(cfg.max_angle)))
         self.messages = [{"role": "system", "content": agent.system_prompt(cfg)}]
         self.busy = False
         self.turns = 0
@@ -481,13 +491,27 @@ class Session:
         return None
 
     # ---------- 回合 ----------
-    def start_turn(self, text, confirm=False):
+    def start_turn(self, text, confirm=False, max_distance=None, max_angle=None):
+        """开一轮。逐轮上限只许往下压，返回这轮**真的生效**的那对数（回显给人核对）。"""
         if self.busy:
             raise Busy("上一条指令还在执行，先等它结束或点急停")
         self.busy = True
         self.refused = False          # 新的一句话 = 新的授权机会
         self.cfg.confirm = bool(confirm)   # 这一轮要不要人点头；一轮只跑一条，改它是安全的
+        dist, ang = self.caps         # 每轮都从天花板重算，上一轮压小过的数不会漏到这一轮
+        d, a = _num(max_distance), _num(max_angle)
+        if d is not None:
+            dist = min(dist, d)
+        if a is not None:
+            ang = min(ang, a)
+        self.cfg.max_distance, self.cfg.max_angle = dist, ang
+        if (dist, ang) != self.caps:
+            # 提示词里那对数是全局上限，改不了；这里补一句本轮的，否则它会按全局去规划，
+            # 然后每条 Move 都被截断 —— 车走的和它说的就对不上。
+            text += "\n\n[本轮单次动作上限压到 %.2f 米 / %.0f 度，超过这个数的部分会被截断；" \
+                    "要更远就分成几步]" % (dist, ang)
         threading.Thread(target=self._run, args=(text,), daemon=True).start()
+        return dist, ang
 
     def _run(self, text):
         try:
@@ -719,8 +743,17 @@ class Handler(BaseHTTPRequestHandler):
                 text = (body.get("text") or "").strip()
                 if not text:
                     return self._send(400, {"error": "text 不能为空"})
-                s.start_turn(text, bool(body.get("confirm")))
-                return self._send(202, {"ok": True})
+                # 逐轮上限：写了就必须是个数，写成 "abc" 不能悄悄当没写（那样发出去的话
+                # 会拿全局上限跑，而发的人以为压小过了）。
+                bad = [k for k in ("max_distance", "max_angle")
+                       if body.get(k) is not None and _num(body.get(k)) is None]
+                if bad:
+                    return self._send(400, {"error": "%s 必须是数字（米 / 度）" % "、".join(bad)})
+                dist, ang = s.start_turn(text, bool(body.get("confirm")),
+                                         body.get("max_distance"), body.get("max_angle"))
+                # 回显**生效**的那对数：调用方传了个比天花板还大的值，这里给的是天花板，
+                # 它对不上的那一刻就是"我以为压住了其实没压"。
+                return self._send(202, {"ok": True, "max_distance": dist, "max_angle": ang})
             if path == "/speak":
                 if not self._same_origin():
                     return self._send(403, {"error": "拒绝跨站请求"})

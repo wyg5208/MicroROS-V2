@@ -14,7 +14,9 @@
    "enabled": false,
    "min_volts": 11.5,
    "max_minutes": 10,
-   "grace_min": 120
+   "grace_min": 120,
+   "max_distance": 1.0,
+   "max_angle": 90
   },
   {
    "name": "只读汇报",
@@ -29,7 +31,9 @@
     6
    ],
    "prompt": "只用 MapInfo 和 GetStatus 汇报：还剩多少未测格、电池多少伏、记住过哪些地点。不要动车",
-   "enabled": false
+   "enabled": false,
+   "max_distance": 0.0,
+   "max_angle": 0.0
   }
  ]
 }
