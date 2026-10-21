@@ -132,6 +132,23 @@ input.num{width:62px}
           <button id=send>发送</button>
         </span>
       </div>
+      <div class="gate" id=goalBox>
+        <div class="row">
+          <span class="hint" title="挂着的一句话，之后每一轮都重述给模型，直到它自己写暗号或轮数用到头">长程目标</span>
+          <input class=txt id=goalText size=40 placeholder="例如：把客厅每个没测到的角落都看一遍，最后回到充电座旁边">
+          <label class=hint>最多 <input class=num id=goalTurns placeholder="上限" style="width:52px"> 轮</label>
+          <button id=goalSet>设目标</button>
+          <button id=goalClear>清除</button>
+        </div>
+        <div class="row" style="margin-top:4px">
+          <button id=goalRun title="发出去的就是定时任务那一班同一句话：现在人点，将来调度器点">按目标再跑一轮</button>
+          <span class="hint" id=goalNow>没有目标</span>
+        </div>
+        <div class="hint">设了目标之后<b>每一句</b>指令都会带上它（随口问一句电量也算掉一轮）。
+          模型做完会在回复最后单独一行写暗号，字样看侧栏「目标」那一行（页面不自己抄一份）；
+          轮数用到头自动作废，不会永远挂着。这一版<b>不自动续跑</b>：一轮跑完要人再点一次「按目标再跑一轮」。
+          目标存在 goal.json，重启这一页不会忘掉它。</div>
+      </div>
     </div>
   </section>
 
@@ -142,6 +159,7 @@ input.num{width:62px}
 const $ = id => document.getElementById(id);
 const feed = $("feed"), approvals = $("approvals");
 let busy = false, seen = 0, es = null, cards = {};
+let goalSeen = null, sentinel = "";     // goalSeen 是服务端回显那一份；sentinel 也只从 /state 拿
 
 function el(tag, cls, text){
   const n = document.createElement(tag);
@@ -194,6 +212,11 @@ function onEvent(ev){
     case "cancelled": msg("note", "已取消", ev.tool + " 没有被执行（你点了拒绝或确认超时）"); break;
     case "auto_denied": msg("note", "自动拒绝", ev.tool + " 没有下发：本轮已经拒绝过一次，模型再请求也不会重新问你。想继续就重新说一句指令。"); break;
     case "blocked": msg("note", "白名单拦下", ev.tool + " 没有被执行：这一轮只允许白名单里的工具，命令没有下发给车。这一轮的闸可以在 :8020/state 的 chat.gates 里核对。"); break;
+    case "goal_set": goalMsg("目标已挂上", ev); break;
+    case "goal_tick": goalMsg("这一轮算进目标", ev); break;
+    case "goal_done": goalMsg("目标宣称完成", ev, "ok"); break;
+    case "goal_expired": goalMsg("目标轮数用完", ev, "bad"); break;
+    case "goal_cleared": goalMsg("目标已清除", ev); break;
     case "approval": makeCard(ev); break;
     case "approval_decided":
     case "approval_expired": killCard(ev.id, ev.type === "approval_expired" ? "超时，默认拒绝" : (ev.allow ? "已允许" : "已拒绝")); break;
@@ -263,6 +286,7 @@ setInterval(tickCards, 200);
 function setBusy(b, text){
   busy = b;
   $("send").disabled = b;
+  paintGoal(goalSeen);      // 「按目标再跑一轮」只能在不忙且有 active 目标时点
   $("status").textContent = b ? (text || "执行中…") : "空闲，可以下指令";
   $("status").className = "hint" + (b ? " warn" : "");
 }
@@ -362,6 +386,99 @@ try {
 ["capDist", "capAng", "capTools"].forEach(id => $(id).addEventListener("input", paintGate));
 $("gatePreset").onchange = paintGate;
 paintGate();
+
+// ---- 长程目标：挂着的一句话，服务端每轮重述一次；这一版不自动续跑 ----
+const GOAL_KEY = "carChatGoalDraft";
+// 这一句是**下一轮那条自动班要发的同一句话**：现在由人点，将来由 car_cron 点，
+// 两条路都走 /chat。改它要同步改 car_cron 那边那份（_goal_test.py 逐字比过）。
+const GOAL_NUDGE = "接着上一个长程目标往下走一步：先看现在的情况，做一件最能推进它的事，" +
+                   "然后说清这一步做了什么、还剩什么；做完了按目标的规矩在最后一行写暗号。";
+const GOAL_CN = {active: "挂着", done: "宣称完成", expired: "轮数用完"};
+
+function goalTurns(){
+  // 与 gateNum 同一把尺：留空=这个字段不发（拿服务端上限），填了不像正数=当场不发这一句。
+  // 上限（30）刻意不写在这里：那是服务端的常数，页面抄一份就会对不上。
+  const raw = $("goalTurns").value.trim();
+  if (raw === "") return [null, ""];
+  const v = Number(raw);
+  if (!isFinite(v) || v < 1 || Math.floor(v) !== v) return [null, "「" + raw + "」不是不小于 1 的整数轮数"];
+  return [v, ""];
+}
+
+function goalBody(){
+  const text = $("goalText").value.trim();
+  if (!text) { note("目标没设：那一栏是空的。要清掉现有的目标点「清除」。"); return null; }
+  const n = goalTurns();
+  if (n[1] !== "") { note("目标没设：" + n[1] + "。留空才等于用服务端的轮数上限。"); return null; }
+  const b = {text: text};
+  if (n[0] !== null) b.max_turns = n[0];
+  return b;
+}
+
+function paintGoal(g){
+  goalSeen = g || null;
+  const on = !!(g && g.status === "active");
+  $("goalBox").className = "gate" + (on ? " on" : "");
+  $("goalNow").textContent = g
+    ? ((GOAL_CN[g.status] || g.status || "?") + "：" + g.text +
+       " · 还剩 " + g.turns_left + " 轮" + (g.why ? "（" + g.why + "）" : ""))
+    : "没有目标";
+  $("goalRun").disabled = busy || !on;
+}
+
+function goalMsg(title, ev, cls){
+  const bits = [];
+  if (ev.turns_left !== undefined && ev.turns_left !== null) bits.push("还剩 " + ev.turns_left + " 轮");
+  if (ev.why) bits.push(ev.why);
+  msg(cls || "note", title, short(ev.text) + (bits.length ? "（" + bits.join(" · ") + "）" : ""));
+}
+
+function setGoal(){
+  if (busy) { note("上一条指令还在执行：先等它结束或点急停，再换目标（一轮跑到一半换目标，这一轮的账会算错头上）。"); return; }
+  const b = goalBody();
+  if (b === null) return;
+  post("/goal", b).then(r => {
+    if (!r.ok) { note("目标没设进去（" + r.status + "）：" + (r.error || "")); return; }
+    paintGoal(r.goal);
+    // 生效的是回显那一份：轮数可能被压到上限，跟逐轮闸同一句规矩
+    note("目标已挂上：" + pretty(r.goal) + "（从下一句起每句都带上它；跑偏了可以在 :8020/state 的 chat.goal 核对）");
+  }).catch(e => note("设目标失败：" + e));
+}
+
+function clearGoal(){
+  post("/goal", {clear: true}).then(r => {
+    if (!r.ok) { note("没清除（" + r.status + "）：" + (r.error || "")); return; }
+    paintGoal(null);
+    note("目标已清除" + (r.cleared ? "（原来那句：" + r.cleared + "）" : "") +
+         "。正在跑的那一轮不会再朝它记账；已经发出去的动作不受影响，要停就点急停。");
+  }).catch(e => note("清除失败：" + e));
+}
+
+function runGoalTurn(){
+  const gates = gateBody();
+  if (gates === null) return;           // gateBody 自己已经说过这一句为什么没发
+  post("/chat", Object.assign({text: GOAL_NUDGE, confirm: $("needConfirm").checked}, gates))
+    .then(r => {
+      if (!r.ok) { note("那一轮没发出去（" + r.status + "）：" + (r.error || "")); return; }
+      note("按目标这一轮的闸已生效：" + pretty({max_distance: r.max_distance,
+                                                max_angle: r.max_angle, allow_tools: r.allow_tools}));
+    }).catch(e => note("发起失败：" + e));
+}
+
+$("goalSet").onclick = setGoal;
+$("goalClear").onclick = clearGoal;
+$("goalRun").onclick = runGoalTurn;
+$("goalText").addEventListener("input", () => {
+  localStorage.setItem(GOAL_KEY, JSON.stringify({t: $("goalText").value, n: $("goalTurns").value}));
+});
+$("goalTurns").addEventListener("input", () => {
+  localStorage.setItem(GOAL_KEY, JSON.stringify({t: $("goalText").value, n: $("goalTurns").value}));
+});
+try {
+  const d = JSON.parse(localStorage.getItem(GOAL_KEY) || "{}");
+  $("goalText").value = d.t || ""; $("goalTurns").value = d.n || "";
+} catch (e) { /* 存坏了就当没写过，别把页面卡死 */ }
+paintGoal(null);
 
 $("needConfirm").checked = localStorage.getItem("carChatConfirm") === "1";
 $("needConfirm").addEventListener("change", e => {
@@ -472,7 +589,11 @@ window.addEventListener("keydown", e => { if (e.key === "Escape" && rec) recStop
 
 function speakIt(text){
   if (speakMuted || !$("speak").checked) return;
-  const t = String(text || "").replace(/[*_`>#|]+/g, " ").replace(/\s+/g, " ").trim();
+  // 暗号那行是写给状态机看的，不是念给人听的（SAPI 会把方括号整段读出来）。
+  // 整句只剩暗号时干脆不出声，别为它单发一次 /speak。
+  const keep = String(text || "").split(/\r?\n/)
+               .filter(l => !sentinel || l.trim() !== sentinel).join(" ");
+  const t = keep.replace(/[*_`>#|]+/g, " ").replace(/\s+/g, " ").trim();
   if (t) post("/speak", {text: t}).catch(() => {});
 }
 $("speak").checked = localStorage.getItem("carChatSpeak") === "1";
@@ -495,8 +616,18 @@ function gateRow(chat){
   return line;
 }
 
+function goalRow(chat){
+  const g = chat.goal;
+  if (!g) return "没有目标 · 暗号 " + (chat.goal_sentinel || "—");
+  return (GOAL_CN[g.status] || g.status || "?") + "：" + g.text +
+         " · 还剩 " + g.turns_left + " 轮 · 暗号 " + (chat.goal_sentinel || "—") +
+         (g.why ? " · " + g.why : "");
+}
+
 function renderStat(c, chat, v){
   const s = $("stat"); s.textContent = "";
+  sentinel = chat.goal_sentinel || "";      // 暗号只认服务端这一份
+  paintGoal(chat.goal);                     // 目标变了（含别处的 curl / 定时任务）一秒内页面就跟上新值
   const asr = (v && v.asr) || {}, tts = (v && v.tts) || {};
   const rows = [
     ["位姿", c.pose ? pretty(c.pose.map(val => fmt(val))) + "（x, y, 朝向°）" : "—"],
@@ -511,6 +642,7 @@ function renderStat(c, chat, v){
              (tts.last && tts.last.indexOf("没出声") >= 0 ? "（" + tts.last + "）" : "")],
     ["这一页", chat.busy ? "回合执行中" : "空闲"],
     ["闸（本轮）", gateRow(chat)],
+    ["目标", goalRow(chat)],
   ];
   rows.forEach(([k, val]) => { s.appendChild(el("b", null, k)); s.appendChild(el("span", null, val)); });
   const up = !!c.online;

@@ -97,7 +97,7 @@ def main(check_only):
     # 2) windows_side / pc_side：按镜像现有的清单逐个刷新（保持精选，不往里倒日志与快照），
     #    再补上"新写的验收脚本 / 新写的重启脚本"这类该进镜像而从没有过的文件
     NEW_TESTS = ("_stall_test.py", "_beep_unit_test.py", "_fit_test.py", "_relaunch_bridge.ps1",
-                 "_clamp_test.py", "_whitelist_test.py", "_ui_gates_test.py")
+                 "_clamp_test.py", "_whitelist_test.py", "_ui_gates_test.py", "_goal_test.py")
     for mirror in (MIRROR_WIN, os.path.join(MIRROR_OFF, "pc_side")):
         if not os.path.isdir(mirror):
             continue

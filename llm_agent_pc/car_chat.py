@@ -38,6 +38,14 @@ SSE_REPLAY = 80
 STATE_TTL = 0.30        # /api/state 的极短缓存：页面每秒问一次，别把控制台问烦
 MOTION_TOOLS = ("Move", "Tour", "MapSpin")
 
+# 长程目标：一句话挂在会话上，之后**每一轮**都重述进那一句指令里，直到模型自己按暗号说做完、
+# 或者轮数用到头。这一轮只做"状态 + 注入 + 记账 + 落盘 + 回显"，到点自动再跑一轮是下一轮的事
+# （那一步走 car_cron，不在这里再造一个 scheduler）。
+GOAL_FILE = os.path.join(HERE, "goal.json")
+GOAL_SENTINEL = "[目标完成]"    # 模型把这几个字单独放最后一行，就算它宣称做完了
+GOAL_MAX_CHARS = 200           # 目标要短：它是每轮都要重念的一句话，不是一份计划书
+GOAL_MAX_TURNS = 30            # 用到头就作废：一环坏了（模型从不写暗号）不能永远挂着
+
 # 语音这条路上没有任何转码环节：浏览器录 16 kHz 单声道、自己拼 WAV 头，
 # whisper.cpp 吃 WAV，SAPI 用 PowerShell 出声。本机没有 ffmpeg，装了也白装。
 ASR_EXE = os.path.join(HERE, "asr", "bin", "Release", "whisper-cli.exe")
@@ -368,6 +376,17 @@ def _tools(v):
     return out, ""
 
 
+def goal_done_says(text):
+    """模型这一轮的回答是否宣称目标做完了 —— 只认**单独占最后一行**的暗号。
+
+    注入那句里本来就写着暗号这五个字，全文搜会把"按规矩我下句该写暗号了"当成做完。
+    判松了目标被抹掉（找不回来），判漏了只是多烧几轮（有 GOAL_MAX_TURNS 兜底）——
+    两个方向不划算，所以取严的那个：整行除了几个 markdown 装饰符之外不许有别的话。
+    """
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    return bool(lines) and lines[-1].strip("*_`>~ ").strip() == GOAL_SENTINEL
+
+
 class Session:
     """一条对话 + 一次只允许一个动作回合 + 一把要人点头的确认闸。"""
 
@@ -394,10 +413,15 @@ class Session:
         self.approve_lock = threading.Lock()
         self.ids = itertools.count(1)
         self._pose0 = None                    # 本次自主动作开始前的位姿
+        # 长程目标：没有目标时是 None，页面和 /state 都按"没有"渲染。
+        self.goal = None
+        self._goal_turn = False               # 本轮是否真带着目标跑（只有带了才记账）
+        self._last_assist = ""                # 本轮模型最后那句回答，用来认暗号
         self._state_cache = (0.0, None)
         self._stop_lock = threading.Lock()
         self._stop_client = None
         cfg.hooks = WebHooks(self)
+        self.load_goal()                      # 重启 :8020 不该把"把客厅走完"忘掉
 
     # ---------- 事件流 ----------
     def publish(self, ev):
@@ -429,6 +453,9 @@ class Session:
                 ev["measured"] = {"delta": round((dx * dx + dy * dy) ** 0.5, 3),
                                   "dyaw": round(dyaw, 1), "pose": [round(v, 3) for v in now]}
             self._pose0 = None
+        elif kind == "assistant":
+            # 收尾那一句就是目标的判决书，得留着；中间步骤的"我打算…"不算。
+            self._last_assist = (ev.get("text") or "").strip() or self._last_assist
         self.publish(ev)
 
     def subscribe(self):
@@ -540,6 +567,18 @@ class Session:
             # 然后每一步都收到一句"没执行"，一轮空转。
             text += "\n\n[本轮只允许调用这些工具：%s；其余调用会被当场拦下、不会下发给车。" \
                     "Stop 不受此限制]" % ("、".join(allow_tools) if allow_tools else "（一个都不许）")
+        # 目标句排在最后追加：没有目标时这一大段一个字都不进，
+        # 发往模型的那句话必须与从前**一字不差**（_goal_test.py 逐字节比过）。
+        self._goal_turn = False
+        self._last_assist = ""
+        g = self.goal
+        if g and g["status"] == "active" and g["turns_left"] > 0:
+            # 目标是"挂着的一句话"，不是一条自动指令：每一轮都重述一遍，否则从第二轮起
+            # 模型只看得到人的新那句话，长程意图就散了。
+            text += "\n\n[长程目标（还剩 %d 轮）：%s —— 这一轮请朝它推进一步。" \
+                    "做完了在这句话的最后单独一行写 %s；没做完就写清这一步做了什么、还剩什么]" \
+                    % (g["turns_left"], g["text"], GOAL_SENTINEL)
+            self._goal_turn = True
         threading.Thread(target=self._run, args=(text,), daemon=True).start()
         return dist, ang, allow_tools
 
@@ -550,6 +589,11 @@ class Session:
         except (agent.McpError, RuntimeError) as exc:
             self.on_event({"type": "error", "text": "%s: %s" % (type(exc).__name__, exc)})
         finally:
+            # 记账放在 finally（半路炸了也要烧额度，否则坏掉的一环永远挂在"还剩 30 轮"上重发），
+            # 而且必须赶在 busy 放开**之前**：早一步开门，下一句就能在上一轮的账没记完时把
+            # _last_assist 和旗子清零 —— 丢一次额度、或者把暗号判漏（实测：另一份判据里
+            # 前一节的会话把目标写进了后一节的文件）。
+            self.finish_goal_turn()
             self.busy = False
             self.turns += 1
             self.trim()
@@ -570,6 +614,122 @@ class Session:
             raise Busy("正在执行，不能清空上下文")
         self.messages[:] = [self.messages[0]]
         self.on_event({"type": "context_cleared"})
+
+    # ---------- 长程目标 ----------
+    def goal_payload(self):
+        """/goal 回显与 /state 共用那一份。没有目标返回 None，页面据此显示"没有目标"。"""
+        g = self.goal
+        if not g:
+            return None
+        return {"text": g["text"], "turns_left": g["turns_left"], "status": g["status"],
+                "set_at": g["set_at"], "why": g.get("why") or ""}
+
+    def set_goal(self, text, turns=None):
+        """立一个目标，返回 (生效那一份, 错误文本)。错了不动现有目标。
+
+        忙的时候不许改：目标是在 start_turn 里念给模型听的，一轮跑到一半换目标，
+        那一轮记的账会算到新目标头上。急停之后再设。
+        """
+        if self.busy:
+            raise Busy("上一条指令还在执行，先等它结束或点急停，再换目标")
+        t = (text or "").strip()
+        if not t:
+            return None, "text 不能为空（要清掉目标请发 {\"clear\": true}）"
+        if len(t) > GOAL_MAX_CHARS:
+            return None, "目标太长：%d 字，上限 %d 字。它每轮都要重念一遍，说清一件事就够" % (
+                len(t), GOAL_MAX_CHARS)
+        n = GOAL_MAX_TURNS if turns is None else min(GOAL_MAX_TURNS, max(1, int(turns)))
+        self.goal = {"text": t, "turns_left": n, "status": "active",
+                     "set_at": time.time(), "why": ""}
+        self.save_goal()
+        self.publish_goal("goal_set", why="还剩 %d 轮" % n)
+        return self.goal_payload(), ""
+
+    def clear_goal(self, why=""):
+        """丢目标。**忙的时候也允许**：清目标是往安全方向走（不再朝它推进），
+        把它挡在"等一轮跑完"后面反而是劝人别清。"""
+        g = self.goal
+        if not g:
+            return False
+        self.goal = None
+        self.save_goal()
+        self.publish_goal("goal_cleared", g, why=why or "人清掉了")
+        return True
+
+    def publish_goal(self, kind, g=None, why=""):
+        """目标事件：把"是哪句话、还剩几轮、为什么变"一起发出去，页面不用再去别处拼。"""
+        g = g or self.goal or {}
+        self.on_event({"type": kind, "text": g.get("text", ""),
+                       "turns_left": g.get("turns_left"), "status": g.get("status"),
+                       "why": why})
+
+    def finish_goal_turn(self):
+        """一轮跑完后的记账：只在这一轮真带着目标时烧一次额度（旗子是 start_turn 置的）。
+
+        判暗号只看**最后一个非空行**：注入那句里就写着 [目标完成] 这五个字，
+        全文搜会把"我按规矩该写暗号了"当成做完，也把上一句"还剩什么"里的引用吃掉。
+        """
+        if not self._goal_turn:
+            return
+        self._goal_turn = False
+        g = self.goal
+        if not g or g["status"] != "active":
+            return
+        done = goal_done_says(self._last_assist)
+        if done:
+            g.update(status="done", turns_left=0, why="模型写了 %s" % GOAL_SENTINEL)
+            self.publish_goal("goal_done", why=g["why"])
+        else:
+            g["turns_left"] = max(0, g["turns_left"] - 1)
+            if g["turns_left"] == 0:
+                g.update(status="expired", why="轮到头了，没等到 %s" % GOAL_SENTINEL)
+                self.publish_goal("goal_expired", why=g["why"])
+            else:
+                self.publish_goal("goal_tick", why="本轮已计入，还剩 %d 轮" % g["turns_left"])
+        self.save_goal()
+
+    def save_goal(self):
+        """目标落盘。写失败必须在日志里说一声：静默失败 = 重启后目标凭空没了，而人以为还挂着。"""
+        try:
+            tmp = GOAL_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.goal, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, GOAL_FILE)
+        except OSError as exc:
+            sys.stderr.write("[goal] 写 %s 失败：%s（重启后这个目标会丢）\n" % (GOAL_FILE, exc))
+            sys.stderr.flush()
+
+    def load_goal(self):
+        try:
+            with open(GOAL_FILE, encoding="utf-8") as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            sys.stderr.write("[goal] 读 %s 失败：%s（按没有目标处理）\n" % (GOAL_FILE, exc))
+            sys.stderr.flush()
+            return None
+        if not isinstance(raw, dict):
+            return None
+        text = (raw.get("text") or "").strip()
+        if not text:
+            return None
+        try:
+            left = int(raw.get("turns_left"))
+        except (TypeError, ValueError):
+            left = 0
+        left = min(max(0, left), GOAL_MAX_TURNS)
+        status = raw.get("status")
+        if status not in ("active", "done", "expired"):
+            status = "expired"
+        if status == "active" and left < 1:
+            status, left = "expired", 0
+        self.goal = {"text": text[:GOAL_MAX_CHARS], "turns_left": left, "status": status,
+                     "set_at": float(raw.get("set_at") or 0.0), "why": str(raw.get("why") or "")}
+        if status == "active":
+            sys.stderr.write("[goal] 恢复长程目标（还剩 %d 轮）：%s\n" % (left, text))
+            sys.stderr.flush()
+        return self.goal
 
     # ---------- 急停 ----------
     def stop(self):
@@ -719,6 +879,13 @@ class Handler(BaseHTTPRequestHandler):
                                               # caps 才是启动那对天花板。页面必须分开显示：把上一轮的"本轮上限 0 米"
                                               # 当成天花板，人就会以为下一句也被锁在 0 米。
                                               "caps": list(s.caps),
+                                              # 目标单独一格：它是**跨轮**挂着的那句话，
+                                              # 不是这一轮的闸。gates 空闲时留的是上一轮的，
+                                              # goal 留的可能是三条之前的——两回事，别混。
+                                              "goal": s.goal_payload(),
+                                              # 暗号字样本身：页面显示"做完要在最后一行写什么"要用它，
+                                              # 让页面自己抄一份 "[目标完成]" 就是两套暗号，改一处就散。
+                                              "goal_sentinel": GOAL_SENTINEL,
                                               "pending": [s._approval_payload(r, a)
                                                           for r, a in s.pending.items()]},
                                     "voice": {"asr": self.asr.info(), "tts": self.speaker.info()},
@@ -821,6 +988,27 @@ class Handler(BaseHTTPRequestHandler):
                 out = s.stop()
                 out["voice"] = self.speaker.stop().get("was")     # 车停了话也不该继续说
                 return self._send(200, out)
+            if path == "/goal":
+                if not self._same_origin():
+                    return self._send(403, {"error": "拒绝跨站请求"})
+                if body.get("clear"):
+                    old = s.goal
+                    s.clear_goal(str(body.get("why") or ""))
+                    return self._send(200, {"ok": True, "goal": None,
+                                            "cleared": (old or {}).get("text")})
+                turns = body.get("max_turns")
+                # 跟逐轮上限同一把尺：写了就必须是个像样的数，写成 "abc" 不能当没写
+                # （那样发的人会以为限了 5 轮，其实拿的是 30 轮上限）。
+                if turns is not None and (isinstance(turns, bool)
+                                          or not isinstance(turns, (int, float))
+                                          or not (1 <= turns <= GOAL_MAX_TURNS)):
+                    return self._send(400, {"error": "max_turns 必须是 1..%d 的数字（轮数）"
+                                              % GOAL_MAX_TURNS})
+                payload, err = s.set_goal(body.get("text") or "", turns)
+                if err:
+                    return self._send(400, {"error": err})
+                # 回显**生效**那一份：轮数可能被压到上限，跟 /chat 那对数是同一条规矩。
+                return self._send(200, {"ok": True, "goal": payload})
             if path == "/reset":
                 if not self._same_origin():
                     return self._send(403, {"error": "拒绝跨站请求"})
