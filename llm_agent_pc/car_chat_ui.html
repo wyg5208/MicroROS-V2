@@ -141,13 +141,14 @@ input.num{width:62px}
           <button id=goalClear>清除</button>
         </div>
         <div class="row" style="margin-top:4px">
-          <button id=goalRun title="发出去的就是定时任务那一班同一句话：现在人点，将来调度器点">按目标再跑一轮</button>
+          <button id=goalRun title="发的就是服务端那句 chat.goal_nudge；car_cron 到点自动发的是同一句话">按目标再跑一轮</button>
           <span class="hint" id=goalNow>没有目标</span>
         </div>
         <div class="hint">设了目标之后<b>每一句</b>指令都会带上它（随口问一句电量也算掉一轮）。
           模型做完会在回复最后单独一行写暗号，字样看侧栏「目标」那一行（页面不自己抄一份）；
           轮数用到头自动作废，不会永远挂着。这一版<b>不自动续跑</b>：一轮跑完要人再点一次「按目标再跑一轮」。
-          目标存在 goal.json，重启这一页不会忘掉它。</div>
+          目标存在 goal.json，重启这一页不会忘掉它；<br>
+          自动续跑：<code>cron_tasks.json</code> 里 <code>use_goal</code> 的班到点发的就是这一句（见手册 §6.7）。</div>
       </div>
     </div>
   </section>
@@ -159,7 +160,8 @@ input.num{width:62px}
 const $ = id => document.getElementById(id);
 const feed = $("feed"), approvals = $("approvals");
 let busy = false, seen = 0, es = null, cards = {};
-let goalSeen = null, sentinel = "";     // goalSeen 是服务端回显那一份；sentinel 也只从 /state 拿
+let goalSeen = null, sentinel = "", nudge = "";   // 三份都只从 /state 拿：goalSeen 是回显，
+                                                   // sentinel/nudge 是字样，页面一份都不抄
 
 function el(tag, cls, text){
   const n = document.createElement(tag);
@@ -212,6 +214,7 @@ function onEvent(ev){
     case "cancelled": msg("note", "已取消", ev.tool + " 没有被执行（你点了拒绝或确认超时）"); break;
     case "auto_denied": msg("note", "自动拒绝", ev.tool + " 没有下发：本轮已经拒绝过一次，模型再请求也不会重新问你。想继续就重新说一句指令。"); break;
     case "blocked": msg("note", "白名单拦下", ev.tool + " 没有被执行：这一轮只允许白名单里的工具，命令没有下发给车。这一轮的闸可以在 :8020/state 的 chat.gates 里核对。"); break;
+    case "gate_notes_expired": note("上一句的临时闸不作废了（划掉 " + ev.n + " 句），本轮生效的是 " + pretty(ev.now) + "。"); break;
     case "goal_set": goalMsg("目标已挂上", ev); break;
     case "goal_tick": goalMsg("这一轮算进目标", ev); break;
     case "goal_done": goalMsg("目标宣称完成", ev, "ok"); break;
@@ -228,7 +231,7 @@ function onEvent(ev){
     case "assistant": msg("bot", "助手", ev.text); speakIt(ev.text); break;
     case "badargs": msg("err", "参数有误", ev.tool + " -> " + ev.text); break;
     case "error": msg("err", "出错", ev.text); break;
-    case "limit": note("已达到单轮最大工具调用次数，这条指令到此为止；再说什么请重新发。"); break;
+    case "limit": note("已达到这一轮的步数上限（--max-steps=" + ev.max_steps + "，一步=一次大模型往返，可带多个工具调用），这条指令到此为止；再说什么请重新发。"); break;
     case "estop": msg("bad", "急停已发出", short(ev.text)); break;
     case "context_trimmed": note("上下文太长，已截到 " + ev.n + " 条。"); break;
     case "context_cleared": note("上下文已清空（只留系统规则）。"); break;
@@ -387,12 +390,10 @@ try {
 $("gatePreset").onchange = paintGate;
 paintGate();
 
-// ---- 长程目标：挂着的一句话，服务端每轮重述一次；这一版不自动续跑 ----
+// ---- 长程目标：挂着的一句话，服务端每轮重述一次；自动续跑发的是同一句（chat.goal_nudge）----
 const GOAL_KEY = "carChatGoalDraft";
-// 这一句是**下一轮那条自动班要发的同一句话**：现在由人点，将来由 car_cron 点，
-// 两条路都走 /chat。改它要同步改 car_cron 那边那份（_goal_test.py 逐字比过）。
-const GOAL_NUDGE = "接着上一个长程目标往下走一步：先看现在的情况，做一件最能推进它的事，" +
-                   "然后说清这一步做了什么、还剩什么；做完了按目标的规矩在最后一行写暗号。";
+// 「按目标再跑一轮」发的那句话**不在这里写**：它是服务端常量 GOAL_NUDGE，从 /state 的
+// chat.goal_nudge 读进来。页面自己抄一份，car_cron 到点发的就会和人手点的不是一句话。
 const GOAL_CN = {active: "挂着", done: "宣称完成", expired: "轮数用完"};
 
 function goalTurns(){
@@ -423,7 +424,7 @@ function paintGoal(g){
     ? ((GOAL_CN[g.status] || g.status || "?") + "：" + g.text +
        " · 还剩 " + g.turns_left + " 轮" + (g.why ? "（" + g.why + "）" : ""))
     : "没有目标";
-  $("goalRun").disabled = busy || !on;
+  $("goalRun").disabled = busy || !on || !nudge;   // 没拿到服务端那句就不许点：发空话比不发更糟
 }
 
 function goalMsg(title, ev, cls){
@@ -457,7 +458,8 @@ function clearGoal(){
 function runGoalTurn(){
   const gates = gateBody();
   if (gates === null) return;           // gateBody 自己已经说过这一句为什么没发
-  post("/chat", Object.assign({text: GOAL_NUDGE, confirm: $("needConfirm").checked}, gates))
+  if (!nudge) { note("那句催促的字样还没从 /state 拿到（聊天页跑的是不认识 goal_nudge 的旧版？），这一轮没发。"); return; }
+  post("/chat", Object.assign({text: nudge, confirm: $("needConfirm").checked}, gates))
     .then(r => {
       if (!r.ok) { note("那一轮没发出去（" + r.status + "）：" + (r.error || "")); return; }
       note("按目标这一轮的闸已生效：" + pretty({max_distance: r.max_distance,
@@ -613,6 +615,10 @@ function gateRow(chat){
              "（天花板 " + (cap.length ? cap.join(" / ") : "—") + "）";
   line += g.allow_tools === undefined || g.allow_tools === null ? " · 工具不限"
           : (g.allow_tools.length ? " · 只许 " + g.allow_tools.join("、") : " · 什么都不许调");
+  // 步数不在那三把闸里（它管的是这一轮能往返几次），不念出来"抬到 30"就只能靠信重启成功。
+  // 旧版 car_chat 不认识这个键，读不到就当没说，不拿猜测填一个数。
+  line += chat.max_steps === undefined || chat.max_steps === null ? ""
+          : " · 一轮最多 " + chat.max_steps + " 步";
   return line;
 }
 
@@ -627,6 +633,7 @@ function goalRow(chat){
 function renderStat(c, chat, v){
   const s = $("stat"); s.textContent = "";
   sentinel = chat.goal_sentinel || "";      // 暗号只认服务端这一份
+  nudge = chat.goal_nudge || "";            // 催促那句也一样（cron 发的是同一份）
   paintGoal(chat.goal);                     // 目标变了（含别处的 curl / 定时任务）一秒内页面就跟上新值
   const asr = (v && v.asr) || {}, tts = (v && v.tts) || {};
   const rows = [

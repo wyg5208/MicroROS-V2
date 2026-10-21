@@ -8,11 +8,16 @@
 
 判读：w 真被执行 -> 每腿 yaw 变化约 +-11°（0.3 rad/s 命令 ~ 9°/s）；
       w 被吞   -> 四条腿的 yaw 变化都贴在 0 上，而 x/y 该走多少走多少。
+跑法：python -X utf8 _cruise_w.py drives      （不给 `drives` 就退出码 2，车一个命令都收不到）
 """
 import json
 import sys
 import time
 import urllib.request
+
+from drives_gate import require_drives  # noqa: E402
+
+require_drives("走 /api/teleop 让车四条腿各挪最多 0.25 m，验巡航时底盘听不听 cmd_vel.angular.z")
 
 CONSOLE = "http://127.0.0.1:8010"
 V, W, T = 0.20, 0.30, 1.2

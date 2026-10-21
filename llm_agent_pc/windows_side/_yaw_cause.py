@@ -18,6 +18,7 @@ A、B、C 必须一起涨；否则说明估计器是坏的，前面那句"没转
   B 与 A 不一致  -> 顺带说明 odom 的 yaw 有没有用 IMU
 
 建图请先关（/api/mapping false）—— 这段实验的位姿本身就是被测对象，别让它投票进图。
+跑法：python -X utf8 _yaw_cause.py drives [速率] [米数] [w]      （要 rclpy，用 `_rosrun.bat`）
 """
 import json
 import math
@@ -25,6 +26,10 @@ import statistics
 import sys
 import time
 import urllib.request
+
+from drives_gate import require_drives  # noqa: E402
+
+require_drives("自己发 cmd_vel（第二个发布者，绕开 Move 的闭环）跑一段，末尾还要原地正转做阳性对照")
 
 import rclpy
 from geometry_msgs.msg import Twist

@@ -1,5 +1,5 @@
 """机器自停走的是它自己的判词，不是"收到停止指令" —— 真车验证。
-usage: python -X utf8 _machine_stop_test.py [dx] [几条命令] [是否停折叠] [先倒退米数] [命令米数] [dy]
+usage: python -X utf8 _machine_stop_test.py drives [dx] [几条命令] [是否停折叠] [先倒退米数] [命令米数] [dy]
 在一条 MCP Move 跑到一半时，用 /api/reloc 故意把位姿平移 offset 米（等价于车被搬走一段，
 只是不用手）。运动中检测器连判两次就该带着自己的判词停车；回包里若出现"收到停止指令"
 说明人工/机器两条通道又混了。结束后把 bias 与建图状态还原。
@@ -10,6 +10,10 @@ import sys
 import threading
 import time
 import urllib.request
+
+from drives_gate import require_drives  # noqa: E402
+
+require_drives("跑一条 0.8 m 的 Move，中途注入位姿平移逼机器自停，事后还原它自己读到的 bias 与建图")
 
 sys.path.insert(0, r"C:\microros-agent")
 from agent import McpClient  # noqa: E402

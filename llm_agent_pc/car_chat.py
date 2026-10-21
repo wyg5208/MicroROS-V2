@@ -45,6 +45,19 @@ GOAL_FILE = os.path.join(HERE, "goal.json")
 GOAL_SENTINEL = "[目标完成]"    # 模型把这几个字单独放最后一行，就算它宣称做完了
 GOAL_MAX_CHARS = 200           # 目标要短：它是每轮都要重念的一句话，不是一份计划书
 GOAL_MAX_TURNS = 30            # 用到头就作废：一环坏了（模型从不写暗号）不能永远挂着
+# 催一轮的那句固定话。它现在由页面「按目标再跑一轮」发，car_cron 到点发的也是**这同一句** ——
+# 所以字样待在服务端、经 /state 的 goal_nudge 下发，页面和调度器都不抄一份。
+# 抄了就是两份：改了页面那句，自动班还在发旧句，而两边日志都写着"朝目标跑了一轮"。
+GOAL_NUDGE = ("接着上一个长程目标往下走一步：先看现在的情况，做一件最能推进它的事，"
+              "然后说清这一步做了什么、还剩什么；做完了按目标的规矩在最后一行写暗号。")
+
+# 逐轮闸写进人那句话时的前缀。下一轮必须把它改成"已作废"：闸本身每轮从 caps 重算，
+# 可这句话是存进 messages 的，模型会把上一班的"0.00 米"当成这一班还生效。
+# 实测（2026-10-21，:8020/history）：只读班（0 米 + 只许 MapInfo/GetStatus）之后的下一句
+# "走正方形 3 圈"已经恢复了 1.5 米/90 度、工具也不限，它仍答"本轮动作上限 0.00 米，无法执行"，
+# 整轮站着没动，要人再发一句"解除上限"才解开。
+GATE_NOTE = "[本轮闸，"
+GATE_NOTE_OLD = "[旧闸已作废，"
 
 # 语音这条路上没有任何转码环节：浏览器录 16 kHz 单声道、自己拼 WAV 头，
 # whisper.cpp 吃 WAV，SAPI 用 PowerShell 出声。本机没有 ffmpeg，装了也白装。
@@ -538,6 +551,21 @@ class Session:
         return None
 
     # ---------- 回合 ----------
+    def expire_gate_notes(self):
+        """把历史里上一轮那句逐轮闸改成"已作废"，返回改了几句。
+
+        只动闸旁白那半句，人写的内容一个字不碰；旧句里不含 `GATE_NOTE`，所以重复调用是幂等的。
+        """
+        n = 0
+        for m in self.messages:
+            if m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, str) and GATE_NOTE in c:
+                n += c.count(GATE_NOTE)
+                m["content"] = c.replace(GATE_NOTE, GATE_NOTE_OLD)
+        return n
+
     def start_turn(self, text, confirm=False, max_distance=None, max_angle=None,
                    allow_tools=None):
         """开一轮。逐轮上限只许往下压，返回这轮**真的生效**的那三样（回显给人核对）。"""
@@ -557,16 +585,25 @@ class Session:
         # 上一班的 `["MapInfo"]` 漏到这一班就是把人的手动指令拦死了。
         self.cfg.allow_tools = allow_tools
         self.gates = {"max_distance": dist, "max_angle": ang, "allow_tools": allow_tools}
+        stale = self.expire_gate_notes()
+        if stale:
+            # 作不作废这件事得让人看见：只靠模型嘴上说"本轮上限 1.5 米"就是又回到自述。
+            self.on_event({"type": "gate_notes_expired", "n": stale, "now": self.gates})
         if (dist, ang) != self.caps:
             # 提示词里那对数是全局上限，改不了；这里补一句本轮的，否则它会按全局去规划，
             # 然后每条 Move 都被截断 —— 车走的和它说的就对不上。
-            text += "\n\n[本轮单次动作上限压到 %.2f 米 / %.0f 度，超过这个数的部分会被截断；" \
+            text += "\n\n" + GATE_NOTE + "单次动作上限压到 %.2f 米 / %.0f 度，超过这个数的部分会被截断；" \
                     "要更远就分成几步]" % (dist, ang)
         if allow_tools is not None:
             # 同上：提示词里写着全部 15 个工具，不补这一句它就会照常去调 Tour，
             # 然后每一步都收到一句"没执行"，一轮空转。
-            text += "\n\n[本轮只允许调用这些工具：%s；其余调用会被当场拦下、不会下发给车。" \
+            text += "\n\n" + GATE_NOTE + "只允许调用这些工具：%s；其余调用会被当场拦下、不会下发给车。" \
                     "Stop 不受此限制]" % ("、".join(allow_tools) if allow_tools else "（一个都不许）")
+        if stale and (dist, ang) == self.caps and allow_tools is None:
+            # 光把旧句划掉不够：模型上一轮自己把"上限 0.00 米"复述了一遍，那句也在历史里。
+            # 恢复天花板时补一句现值，让它读到的**最后一句**是这一轮的数。
+            text += "\n\n[上一轮的临时闸已作废：本轮没有新闸，单次动作上限就是全局的 %.2f 米 / %.0f 度，" \
+                    "工具不限]" % (dist, ang)
         # 目标句排在最后追加：没有目标时这一大段一个字都不进，
         # 发往模型的那句话必须与从前**一字不差**（_goal_test.py 逐字节比过）。
         self._goal_turn = False
@@ -879,6 +916,9 @@ class Handler(BaseHTTPRequestHandler):
                                               # caps 才是启动那对天花板。页面必须分开显示：把上一轮的"本轮上限 0 米"
                                               # 当成天花板，人就会以为下一句也被锁在 0 米。
                                               "caps": list(s.caps),
+                                              # 一轮的步数上限也得上这一格：它不住在逐轮闸里（闸只管位移/转角/工具），
+                                              # 不亮出来的话，"抬到 30"这件事在真机上只能靠信重启成功了。
+                                              "max_steps": s.cfg.max_steps,
                                               # 目标单独一格：它是**跨轮**挂着的那句话，
                                               # 不是这一轮的闸。gates 空闲时留的是上一轮的，
                                               # goal 留的可能是三条之前的——两回事，别混。
@@ -886,6 +926,10 @@ class Handler(BaseHTTPRequestHandler):
                                               # 暗号字样本身：页面显示"做完要在最后一行写什么"要用它，
                                               # 让页面自己抄一份 "[目标完成]" 就是两套暗号，改一处就散。
                                               "goal_sentinel": GOAL_SENTINEL,
+                                              # 那句催促也一样：谁发都发服务端这一份，
+                                              # 页面与 car_cron 只读不抄（cron 靠它保证
+                                              # "到点自动跑的那一轮"和"人点的那一轮"是同一句话）。
+                                              "goal_nudge": GOAL_NUDGE,
                                               "pending": [s._approval_payload(r, a)
                                                           for r, a in s.pending.items()]},
                                     "voice": {"asr": self.asr.info(), "tts": self.speaker.info()},

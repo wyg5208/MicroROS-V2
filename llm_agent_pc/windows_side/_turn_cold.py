@@ -8,6 +8,7 @@ the gap between "odom is fresh again" and "first Move" has to stay a few hundred
 
 Mapping is switched off for the run so these spins cannot add more smear to a map that is
 already the documented casualty of iteration 3.
+跑法：python -X utf8 _turn_cold.py drives [条数] [度数] [方向] [--cold]
 """
 import json
 import math
@@ -16,6 +17,10 @@ import subprocess
 import sys
 import time
 import urllib.request
+
+from drives_gate import require_drives  # noqa: E402
+
+require_drives("连做 N 条 30 度原地转弯（默认 10 条）；带 --cold 时还会先杀掉并重起 bridge")
 
 sys.path.insert(0, r"C:\microros-agent")
 from agent import McpClient  # noqa: E402

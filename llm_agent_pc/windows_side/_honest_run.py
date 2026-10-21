@@ -4,7 +4,7 @@
 刚把"停"的门槛加了一条新通道（打分看不出、靠看得穿的墙指认），所以必须当着车证明它
 不会在诚实的位姿上乱按停：一条 MCP Move 走完，`motion["n"]`（机器中止次数）必须还是 0，
 日志里不许出现"机器判定"，可疑帧也不许被扣在图外（`扣票` 必须一路是 0，否则建图被拖慢）。
-usage: python -X utf8 _honest_run.py [米数]
+usage: python -X utf8 _honest_run.py drives [米数]
 """
 import json
 import math
@@ -12,6 +12,10 @@ import sys
 import threading
 import time
 import urllib.request
+
+from drives_gate import require_drives  # noqa: E402
+
+require_drives("真走一条 MCP Move（默认 0.6 m）当反向对照：验的是它不该自己按停")
 
 sys.path.insert(0, r"C:\microros-agent")
 from agent import McpClient  # noqa: E402

@@ -16,6 +16,7 @@ import argparse
 import base64
 import itertools
 import json
+import math
 import os
 import re
 import subprocess
@@ -315,6 +316,19 @@ def clamp_motion(cfg, name, args):
             if c != v:
                 args[key] = c
                 notes.append("%s %s 压到 %s" % (key, v, c))
+    # 弧线：radius 是几何，不是运动量，所以它躲开了上面那对数 —— 但一条弧同时是位移**和**转角，
+    # 两把闸都得压得住它，否则"本轮只许转 45 度"会被一句 arc_left + radius=0.4 + distance=1.5
+    # （实际扫 215 度）整段绕过去。这里把扫角上限换算成弧长再夹一次（先夹过的 distance 只会更小）。
+    d = str(args.get("direction") or "").strip().lower()
+    if d in ("arc_left", "arc_right"):
+        r, s = args.get("radius"), args.get("distance")
+        if (isinstance(r, (int, float)) and not isinstance(r, bool) and r > 0
+                and isinstance(s, (int, float)) and not isinstance(s, bool)):
+            cap_s = math.radians(abs(float(cfg.max_angle))) * float(r)
+            if abs(s) > cap_s:
+                args["distance"] = math.copysign(cap_s, s)
+                notes.append("distance %s 按 %.0f 度扫角上限折成弧长压到 %s（半径 %s m）" % (
+                    s, abs(float(cfg.max_angle)), round(args["distance"], 3), r))
     return args, "、".join(notes)
 
 
@@ -339,7 +353,7 @@ class ConsoleHooks:
         elif kind == "blocked":
             print(f"  [{ev['step']}] {ev['tool']} 被本轮工具白名单拦下（没有下发给车）")
         elif kind == "limit":
-            print("\n[已达到单轮最大工具调用次数，等待用户新指令]")
+            print("\n[已达到单轮步数上限 --max-steps=%d，等待用户新指令]" % ev["max_steps"])
 
     def confirm(self, name, args):
         ans = input(f"  将执行 {name} {json.dumps(args, ensure_ascii=False)} ，回车 y 确认 / n 取消: ")
@@ -351,7 +365,7 @@ SYSTEM_PROMPT = """你是运行在 Windows 笔记本上的 MicroROS-V2 智能小
 工作规则：
 1. 需要动作或环境信息时必须调用工具，不要凭空描述结果。只有工具真实返回过的内容才算发生过；没有 Move 的工具结果就不能说车已经移动，没有 GetStatus 就不能报里程计坐标。
 2. 想做视觉判断而上下文里没有画面时，先调用 SeeWhat 拍照；工具结果里若带"视觉模型描述"，据此回答。
-3. Move 用里程计闭环，distance 单位米、angle 单位度；direction 只能是 forward/backward/turn_left/turn_right。
+3. Move 用里程计闭环，distance 单位米、angle 单位度；direction 只能是 forward/backward/turn_left/turn_right/arc_left/arc_right。弧线（arc_*）是**边走边弯**：distance 是沿弧线走过的米数（不是首尾直线距离），radius 半径米数必须给，车画得出的半径带写在 Move 的工具说明里（别自己估，超带的会被当场退回并告诉你能用的范围）。一条弧同样受下面那对上限约束，所以"绕一圈"要分几段发。用户只要"往前/往后/原地转"时就用原来的四个方向，弧线不是每个动作都要用。
 4. 雷达正前方约 44° 被云台自身遮挡。要用环境信息就先调 ScanRing 看环视；需要正前方净空调 CheckAhead（它原地左右各偏 30° 补测后回正）。没有测到的方向不等于空旷。
 5. 单次动作不要超过 %s 米或 %s 度，复杂任务拆成多步，每步汇报结果。这两个上限就是机器真会执行的上限，别按更大的数规划。
 6. 工具返回失败时先分清是哪一类，不要一律停手也不要一律重试：
@@ -450,7 +464,7 @@ def run_turn(cfg, mcp, tools_spec, name_map, messages, user_text):
                          "args": args, "text": result, "secs": secs})
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
     else:
-        hooks.event({"type": "limit"})
+        hooks.event({"type": "limit", "max_steps": cfg.max_steps})
 
 
 def build_argparser():
@@ -472,7 +486,10 @@ def build_argparser():
     p.add_argument("--self-test", action="store_true", help="离线自测：内置 mock MCP + mock LLM")
     p.add_argument("--dry-run", action="store_true", help="只打印工具调用，不下发给车")
     p.add_argument("--no-confirm", dest="confirm", action="store_false", help="关闭移动动作人工确认")
-    p.add_argument("--max-steps", type=int, default=10)
+    p.add_argument("--max-steps", type=int, default=30,
+                   help="一轮最多几步；一步=一次大模型往返，里面可以带多个工具调用。"
+                        "2026-10-21 实测：'走 0.5 米边长的正方形 3 圈'要 24 次 Move，"
+                        "再加途中一次受阻、一次脱困就是 27 步，10 会在第三条边掐断")
     p.add_argument("--max-distance", type=float, default=1.0, help="单次 Move 最大位移(米)")
     p.add_argument("--max-angle", type=float, default=360.0, help="单次 Move 最大转角(度)")
     p.add_argument("--allow-tools", nargs="+", metavar="TOOL", default=None,

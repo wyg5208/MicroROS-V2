@@ -104,6 +104,86 @@ def achieved(v, w):
     return ACT_GAIN_V * k * v, w * k
 
 
+# -------------------------------------------------------------------- arcs ---
+# Move(direction="arc_left"/"arc_right") is the only place a curve is commanded, and the two
+# functions below are the whole answer to "can this chassis draw this circle at all".
+#
+# The reason they exist instead of the obvious `w = v / R`: the fitted stiction eats a third of
+# the curvature, so the naive command lands 1.2-1.9x wide of the requested circle. That is not a
+# car measurement but arithmetic through `achieved()` (whose gains *were* fitted on the car):
+# asking for R=0.60 m delivers 0.80 m, and asking for R=1.67 m delivers 7.5 m, i.e. a straight
+# line. An open-loop arc would therefore draw a slightly-too-flat path on every call and fold it
+# into the map as if it were the path that was asked for.
+ARC_KP = 1.5              # 1/m of curvature added per metre of radial error (P gain, no I term)
+
+
+def arc_band(v_cmd):
+    """Radii (metres) the arc loop can actually hold at this commanded line speed: (tight, gentle).
+
+    Both ends are the same inequality seen from opposite sides: to sit on a circle of R the board
+    has to *deliver* v_act/R, so the command that buys it is (v_act/R + bias)/gain, and that
+    command must land inside [turn_floor, MAX_W]. `volt_scale()` cancels out -- the pack sag shrinks
+    v and w together, so a circle stays a circle as the battery droops (the stiction does not scale,
+    which is why the gentle end moves a little but the tight end does not).
+    """
+    if v_cmd <= 0.0:
+        return (0.0, 0.0)
+    v_act = ACT_GAIN_V * v_cmd
+    head = ACT_GAIN_W * MAX_W - ACT_W_BIAS        # most delivered rate the command ceiling buys
+    r_min = (v_act / head) if head > 0 else float("inf")
+    slope = ACT_GAIN_W * turn_floor() - ACT_W_BIAS  # least delivered rate that still turns
+    r_max = (v_act / slope) if slope > 0 else float("inf")
+    return (r_min, r_max)
+
+
+def arc_min_speed(radius):
+    """The slowest forward command (m/s) that can still bend at this radius.
+
+    This is the same inequality as `arc_band`'s gentle end, read from the other side: below this
+    speed the curvature the circle asks for would need a turn command inside the band the wheels
+    ignore, and `arc_plan` rightly refuses to send it -- so a plain proportional tail would crawl
+    the last centimetres of every arc in a *straight line*. That is both a wrong path and a false
+    curvature alarm, and it is why `Car.arc` keeps its tail speed up instead of easing off.
+    """
+    slope = ACT_GAIN_W * turn_floor() - ACT_W_BIAS
+    return (slope * abs(radius) / ACT_GAIN_V) if slope > 0 else 0.0
+
+
+def arc_plan(radius, r_err, v_cmd, side):
+    """One tick of the arc loop -> (w_cmd, kappa, went_straight).
+
+    `r_err` is |P - C| - R, the signed distance from the circle this arc was started on: positive
+    means the car is riding *outward*, i.e. it is not curving enough, so curvature goes up. That
+    monotone direction is the whole control law and it is what `_arc_test.py` pins -- a sign flip
+    here would make the car curve harder *away* from the target and the loop would never notice,
+    because both of its rulers would keep agreeing with each other.
+
+    A command that lands under `turn_floor()` is deliberately turned into zero instead of being
+    floored up: the wheels ignore that band, so "floor it up" would be claiming a correction the
+    chassis cannot make. Going straight for one tick is the honest reading of "this tick needs
+    less turn than the car is able to give".
+    """
+    if radius <= 0.0 or v_cmd <= 0.0:
+        return (0.0, 0.0, True)
+    side = 1.0 if side >= 0.0 else -1.0      # +1 = 向左（逆时针）= ROS 里 angular.z 的正号
+    kappa = max(0.0, 1.0 / radius + ARC_KP * float(r_err))
+    if side < 0.0:
+        gain, bias = ACT_GAIN_W_NEG, ACT_W_BIAS_NEG
+    else:
+        gain, bias = ACT_GAIN_W, ACT_W_BIAS
+    # Solved in the command domain, not the delivered one: `achieved()` scales BOTH delivered axes
+    # by volt_scale(), and a circle is a ratio of the two, so the pack sag cancels. Applying it to
+    # only the line speed here would leave the (un-scaled) stiction on the other side and widen
+    # every arc by about the fraction the battery drooped -- a path that is quietly off the map.
+    want_w = ACT_GAIN_V * v_cmd * kappa
+    w_cmd = (want_w + bias) / gain if want_w > 0.0 else 0.0
+    if w_cmd <= 0.0:
+        return (0.0, kappa, True)
+    if w_cmd < turn_floor():
+        return (0.0, kappa, True)
+    return (math.copysign(min(w_cmd, MAX_W), side), kappa, False)
+
+
 # ---------------------------------------------------------------- costmap ----
 class Costmap:
     """Sliding odom-frame window: saved grid underneath, live lidar ring on top."""

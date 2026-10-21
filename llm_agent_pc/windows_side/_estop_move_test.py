@@ -1,5 +1,5 @@
 """急停能否打断一条正在跑的 MCP Move —— 真车 A/B。
-usage: python -X utf8 _estop_move_test.py [stop|full] [distance]
+usage: python -X utf8 _estop_move_test.py drives [stop|full] [distance]
 stop 走聊天页面那颗按钮的同一个端点（:8020/stop），不是绕过界面直接戳控制台。
 """
 import json
@@ -8,6 +8,10 @@ import sys
 import threading
 import time
 import urllib.request
+
+from drives_gate import require_drives  # noqa: E402
+
+require_drives("无参数就会前进 0.5 m 再按一次人工急停（默认 mode=stop）")
 
 sys.path.insert(0, r"C:\microros-agent")
 from agent import McpClient  # noqa: E402

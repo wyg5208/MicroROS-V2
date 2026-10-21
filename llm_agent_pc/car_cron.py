@@ -22,7 +22,9 @@
        "prompt": "先看 MapInfo，把剩下的未测格用 Tour 走掉；每次 Move 不要超过 1.0 米，走三轮就停下汇报",
        "enabled": false, "min_volts": 11.5, "max_minutes": 10,
        "grace_min": 120, "require_map": true, "min_agree": 0.80, "max_odom_age": 2.0,
-       "max_distance": 0.8, "max_angle": 90}]}
+       "max_distance": 0.8, "max_angle": 90},
+      {"name": "朝目标续跑", "at": "21:00", "every_min": 20, "use_goal": true,
+       "enabled": false, "max_minutes": 6, "max_distance": 0.8, "max_angle": 45}]}
 
 急停有两个，都不用碰这个脚本：`cron.pause` 文件一存在就**一班都不发**（连手动点火也挡着，
 恢复就是删掉它）；页面上那个"急停"仍能在动作中途把车掐停。另外每条任务有 `max_minutes`，
@@ -36,11 +38,20 @@
 工具调用会在服务端被拦下，**根本不发给车**。上限管的是"这一步别走太远"，白名单管的才是"这一班根本
 不该动车"，两者互补 —— 只读汇报那种任务要的是后者。`Stop` 不受名单限制（任何时候都能停），
 人那一侧的急停更不经过这里。同样要核对回显，回显里没有这个字段就当场急停。
+
+`use_goal: true` 把这班交给**长程目标**：那句话不由任务表写，发的是服务端 `chat.goal_nudge` 那一句，
+和页面上「按目标再跑一轮」按出去的**一字不差** —— 自动班和人点的那班因此是同一句话、同一份账。
+它只在挂着 active 目标时才发：没目标、目标已经 done/expired、轮数到头、聊天页是不认识 goal_nudge 的
+旧版，四种一律跳过并把人话理由写进日志。再配 `every_min: 20` 就成循环：当天从 `at` 起每这么多分钟
+发一班，窗口仍是 `grace_min`（到 23:59 收口，不跨午夜）。循环有两道刹车，都收进 `_cron_fired.json`
+的 `halted`：上一班撞到 `max_minutes` 被这边掐停了、或者闸没被回显接住 —— 之后当天不再发下一班。
+无人值守的循环最怕的不是"跑歪一步"，是"歪了还自己接下一班"。
 """
 import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -54,12 +65,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULTS = {"min_volts": 11.5, "max_minutes": 10.0, "grace_min": 120,
             "require_map": True, "min_agree": 0.80, "max_odom_age": 2.0,
             "days": None, "enabled": False, "max_distance": None, "max_angle": None,
-            "allow_tools": None}
+            "allow_tools": None, "use_goal": False, "every_min": None}
 TEMPLATE = {"tasks": [{"name": "晚间断头巡游", "at": "22:30", "days": [0, 1, 2, 3, 4],
                        "prompt": "先看 MapInfo，把剩下的未测格用 Tour 走掉；每次 Move 不要超过 1.0 米",
-                       "max_distance": 1.0, "enabled": False}]}
+                       "max_distance": 1.0, "enabled": False},
+                      {"name": "朝目标续跑", "at": "21:00", "every_min": 20, "use_goal": True,
+                       "max_minutes": 6, "max_distance": 0.8, "max_angle": 45, "enabled": False}]}
 
 PATHS = {"dir": HERE}                      # --self-test 会把它挪进临时目录，别污染真状态
+
+# "闸没被回显接住"这句话里的记号。循环刹车靠它分辨两种失败：话根本没进场（HTTP 失败，下一班照发）
+# 和话已经进场了、正拿着全局上限跑（那边已经发过急停）。判据会核对真消息里带着这个记号。
+STOPPED_MARK = "已发急停"
 
 
 def log(msg, now=None):
@@ -88,11 +105,34 @@ def load_tasks(path=None):
         t.update(item or {})
         t["grace_min"] = float(t["grace_min"])
         t["max_minutes"] = float(t["max_minutes"])
-        if not t.get("name") or not t.get("prompt"):
-            return out, "第 %d 条缺 name 或 prompt" % (i + 1)
+        if not t.get("name"):
+            return out, "第 %d 条缺 name" % (i + 1)
+        if not t.get("prompt") and not t.get("use_goal"):
+            return out, "第 %d 条（%s）缺 prompt：要么自己写一句话，要么写 use_goal 让它发服务端那句目标催促" % (i + 1, t["name"])
         if t["name"] in names:
             return out, "任务重名：%s（去重按名字记，重名会互相顶掉）" % t["name"]
         names.add(t["name"])
+        if "use_goal" in (item or {}) and not isinstance(t["use_goal"], bool):
+            # 和 allow_tools 同一个道理：写错了不许当"没写"。当没写 = 那班发的是任务表里那句
+            # 自己写的话（或者干脆没有话），而人以为它发的是目标那句。
+            return out, "任务 %s 的 use_goal 不是 true/false：%r" % (t["name"], item.get("use_goal"))
+        if t["use_goal"] and t.get("prompt"):
+            return out, ("任务 %s 同时写了 prompt 和 use_goal：自动班必须发服务端 chat.goal_nudge 那一句，"
+                         "自己写的那句请删掉（要发自己那句就把 use_goal 改成 false）" % t["name"])
+        if t["every_min"] is not None:
+            try:
+                t["every_min"] = float(t["every_min"])
+            except (TypeError, ValueError):
+                return out, "任务 %s 的 every_min 不是分钟数：%r（不要循环就整条别写）" % (t["name"], item.get("every_min"))
+            if t["every_min"] < 1:
+                return out, "任务 %s 的 every_min=%g 太小（至少 1 分钟：跑完之前那一班自己会跳过，别拿更密的轮询当推进）" % (
+                    t["name"], t["every_min"])
+            if not t["use_goal"]:
+                # 循环只给目标班开：目标那边有 turns_left 计数、有暗号、有 200 字/30 轮上限，
+                # 一轮跑歪了会自己把额度烧完。自己写的一句话没有这套账，每 20 分钟重发一遍
+                # 就是一个没人看着的循环。
+                return out, ("任务 %s 写了 every_min 但没写 use_goal：自己写的那句话每隔几分钟重发一遍，"
+                             "这边没有能兜住它的额度（要续跑目标就写 use_goal）" % t["name"])
         for key in ("max_distance", "max_angle"):
             if t[key] is None:
                 continue
@@ -161,12 +201,33 @@ def slot(task, now):
     return None, None
 
 
+def loop_step(task):
+    """循环班隔多少分钟发一班；不是循环（含只发一班的 use_goal 班）返回 None。"""
+    if task.get("use_goal") and task.get("every_min"):
+        return float(task["every_min"])
+    return None
+
+
+def slot_index(task, fire_at, now):
+    """现在落在这天第几个班点上（第 0 班 = `at` 那一刻）。
+
+    不是循环班就一律 0 —— 去重记法和以前"一天一班"一模一样，老任务表一个字不改行为不变。
+    """
+    step = loop_step(task)
+    if step is None:
+        return 0
+    return max(0, int((now - fire_at).total_seconds() // (60.0 * step)))
+
+
 def due(task, now, rec):
     """这一班该不该发。返回 (发, 要记下的状态, 给人看的说明或 None)。
 
     同一班只发一次：计划程序每分钟调一遍 = 一天 1440 次，没这层去重就是每天发 1440 遍。
+    循环班这句改成**同一个班点只发一次**（第几班见 slot_index）—— 否则每 20 分钟那一班会在
+    22:30~22:49 之间发 20 遍。
     睡过头在宽限内补跑（合上盖子最容易撞上），过了宽限记成"错过"并按**那一班的日期**收口 ——
     否则一条"错过"会在日志里从半夜刷到午夜。
+    halted 是循环的刹车（上一班被急停掐停、或闸没接住），它把这一天剩下的班全部收掉。
     """
     if not task["enabled"]:
         return False, None, None
@@ -174,14 +235,19 @@ def due(task, now, rec):
     if fire_at is None:
         return False, None, None
     day = fire_at.strftime("%Y-%m-%d")
-    if rec.get("date") == day and rec.get("state") in ("fired", "missed"):
+    idx = slot_index(task, fire_at, now)
+    if rec.get("date") == day and rec.get("state") in ("halted", "missed"):
+        return False, None, None
+    if rec.get("date") == day and rec.get("state") == "fired" and int(rec.get("slot") or 0) >= idx:
         return False, None, None
     if task["days"] is not None and fire_at.weekday() not in task["days"]:
         return False, None, None                    # 那一天的班不归它管，别在日志里刷屏
     if now > last:
-        return False, {"date": day, "state": "missed"}, "%s %s 那班错过（宽限 %g 分钟，不跨午夜）" % (
+        if rec.get("date") == day and rec.get("state") == "fired":
+            return False, None, None                # 循环窗口自己走完了，那班发过，别喊"错过"
+        return False, {"date": day, "state": "missed", "slot": idx}, "%s %s 那班错过（宽限 %g 分钟，不跨午夜）" % (
             day, task["at"], task["grace_min"])
-    return True, {"date": day, "state": "fired"}, None
+    return True, {"date": day, "state": "fired", "slot": idx}, None
 
 
 def caps_note(task):
@@ -274,6 +340,26 @@ def preflight(task, chat, car, occ):
     return why
 
 
+def goal_note(chat):
+    """这一班该发哪句话、或者为什么不发。返回 (话或 None, 人话理由或 None)。
+
+    话不是这里写的：取服务端 `chat.goal_nudge`，和页面上「按目标再跑一轮」按出去的那句**一字不差**。
+    四种跳过各说各的原因 —— 无人值守最容易出的事，是"没人在场，它拿一句没有目标可推进的话在跑"。
+    """
+    nudge = chat.get("goal_nudge")
+    if not isinstance(nudge, str) or not nudge.strip():
+        return None, ("聊天页 :8020 没下发那句目标催促：它多半还在跑不认识 goal_nudge 的旧版 car_chat.py，重启它")
+    g = chat.get("goal")
+    if not g:
+        return None, "现在没挂着长程目标：在页面上先立一个，或者把这条班的 use_goal 关掉"
+    if g.get("status") != "active":
+        return None, "目标已经是「%s」状态，不再自动续跑（要接着做就重新立一个）" % (g.get("status") or "?")
+    left = g.get("turns_left")
+    if not isinstance(left, int) or isinstance(left, bool) or left < 1:
+        return None, "目标的轮数到头了（还剩 %s 轮）：自动班不替它续额度" % left
+    return nudge, None
+
+
 def run_once(tasks, api, now, fired, dry=False, force=None):
     """跑一班，返回这班对每条任务做了什么（--self-test 就断言这个）。"""
     did = []
@@ -306,32 +392,57 @@ def run_once(tasks, api, now, fired, dry=False, force=None):
             fired[name] = {"date": now.strftime("%Y-%m-%d"), "state": "blocked", "reasons": why}
             did.append((name, "blocked", why))
             continue
+        # 话由谁定：普通班发任务表里那句，目标班发服务端那句催促（这里不抄，只取回）。
+        text = task.get("prompt")
+        if task.get("use_goal"):
+            text, skip = goal_note(chat)
+            if skip:
+                if rec.get("reasons") != [skip]:        # 同一个理由一天只骂一次
+                    log("%s 跳过：%s" % (name, skip), now)
+                fired[name] = {"date": day, "state": "blocked", "reasons": [skip]}
+                did.append((name, "blocked", [skip]))
+                continue
         if dry:
             note = gate_note(task)
             log("%s [dry-run] 体检全过，本该发这句%s：%s" % (
-                name, "（" + note + "）" if note else "", task["prompt"]), now)
+                name, "（" + note + "）" if note else "", text), now)
             did.append((name, "dry", []))
             continue
         turns0 = (chat or {}).get("turns", 0)
         note = gate_note(task)
         log("%s 触发（体检全过%s）：%s" % (
-            name, "，" + note if note else "", task["prompt"]), now)
-        err = api.post_chat(task["prompt"], task["max_distance"], task["max_angle"],
+            name, "，" + note if note else "", text), now)
+        err = api.post_chat(text, task["max_distance"], task["max_angle"],
                             task["allow_tools"])
         if err:
             log("%s 发不出去：%s" % (name, err), now)
-            fired[name] = {"date": now.strftime("%Y-%m-%d"), "state": "blocked", "reasons": [err]}
+            # 发不出去有两种：这班本来就发不动（blocked，下一分钟/下一班还可以再试），
+            # 和**戴着闸的话被掐停了**（闸没接住 = 那句话此刻正拿全局上限、全套 15 个工具跑着）。
+            # 后者对循环班必须当天收口：不然后一班每 20 分钟把同一句没闸的话再放出去一次。
+            # 分辨这两种只看消息里那个 STOPPED_MARK 记号（发不出去=话没进场，没记号；闸没接住=话已经在
+            # 里面跑了，post_chat 补过急停、必带记号）。判据会核对真消息确实带着它。
+            halt = loop_step(task) is not None and STOPPED_MARK in err
+            fired[name] = {"date": day, "state": "halted" if halt else "blocked", "reasons": [err]}
+            if halt:
+                log("%s 这个循环今天到此为止：闸没被回显接住，不要下一班" % name, now)
             did.append((name, "post_failed", [err]))
             continue
         upd["reasons"] = []
         fired[name] = upd
         state, info = wait_done(api, turns0, 60.0 * task["max_minutes"])
-        text = api.last_text()
+        said = api.last_text()
         log("%s %s（%.0f s，轮次到 %s）%s" % (
             name, state, info.get("used_s", 0), info.get("turns"),
-            "：「%s」" % text[:120] if text else ""), now)
+            "：「%s」" % said[:120] if said else ""), now)
         write_last({"name": name, "at": now.strftime("%Y-%m-%d %H:%M:%S"), "state": state,
-                    "gates": note, "info": info, "said": text, "prompt": task["prompt"]})
+                    "gates": note, "info": info, "said": said, "prompt": text})
+        # 循环的第一道刹车：上一班是撞到 max_minutes 被这边掐停的。
+        # 那一班为什么停还没人知道（模型卡住？车卡住？网络断？），这种情况下"过 20 分钟再发一句"
+        # 是最不该自动做的事 —— 记 halted，当天剩下的班全部收掉。
+        if state == "超时已急停" and loop_step(task) is not None:
+            upd["state"] = "halted"
+            log("%s 这个循环今天到此为止：上一班是 %g 分钟上限掐停的，没人看着就别让它自己接下一班" % (
+                name, task["max_minutes"]), now)
         did.append((name, state, info))
     save_fired(fired)
     return did
@@ -365,14 +476,15 @@ def next_note(task, now):
         return "未启用（enabled=false 就永远不发）"
     h, m = parse_at(task["at"])
     hh = "%02d:%02d" % (h, m)
+    step = "" if loop_step(task) is None else "每 %g 分钟一班、" % loop_step(task)
     if task["days"] is not None and now.weekday() not in task["days"]:
         return "今天（周%s）不在它的星期里；它写的时间是 %s" % ("一二三四五六日"[now.weekday()], hh)
     fire_at, last = slot(task, now)
     if fire_at is None or fire_at.date() != now.date():
-        return "今天 %s 还没到（过后 %g 分钟内算这一班；宽限不跨午夜）" % (hh, task["grace_min"])
+        return "今天 %s 还没到（%s过后 %g 分钟内算这一班；宽限不跨午夜）" % (hh, step, task["grace_min"])
     if now <= last:
-        return "%s 已过点，宽限内还会试（最晚到 %s）" % (hh, last.strftime("%H:%M"))
-    return "%s 那班已过期（宽限 %g 分钟、不跨午夜），下一班明天" % (hh, task["grace_min"])
+        return "%s 已过点，宽限内还会试（%s最晚到 %s）" % (hh, step, last.strftime("%H:%M"))
+    return "%s 那班已过期（%s宽限 %g 分钟、不跨午夜），下一班明天" % (hh, step, task["grace_min"])
 
 
 # --------------------------------------------------------------------- HTTP --
@@ -443,9 +555,9 @@ class HttpApi(object):
             self.post_stop()
             want = gate_note({"max_distance": max_distance, "max_angle": max_angle,
                               "allow_tools": allow_tools}) or "没要求"
-            return ("%s没生效（要 %s，:8020 回显 %s）：已发急停。"
-                    "多半是聊天页还在跑不认识这些字段的旧版 car_chat.py，重启它" % (
-                        "、".join(bad), want, json.dumps(echo, ensure_ascii=False)[:120]))
+            return ("%s没生效（要 %s，:8020 回显 %s）：" + STOPPED_MARK + "。"
+                    "多半是聊天页还在跑不认识这些字段的旧版 car_chat.py，重启它") % (
+                        "、".join(bad), want, json.dumps(echo, ensure_ascii=False)[:120])
         return None
 
     def post_stop(self):
@@ -635,7 +747,10 @@ def self_test():
     with open(p, "w", encoding="utf-8") as fh:
         json.dump(TEMPLATE, fh, ensure_ascii=False)
     ts, err = load_tasks(p)
-    ck("模板任务表能读，且默认未启用", [err, len(ts), ts[0]["enabled"]], [None, 1, False])
+    ck("模板任务表能读，且两条都默认未启用", [err, len(ts), ts[0]["enabled"], ts[1]["enabled"]],
+       [None, 2, False, False])
+    ck("  模板里那条目标班：话由服务端给，循环 20 分钟一班",
+       [ts[1]["use_goal"], ts[1].get("prompt"), ts[1]["every_min"]], [True, None, 20.0])
     ck("缺的字段补上保守默认", [ts[0]["min_volts"], ts[0]["grace_min"], ts[0]["require_map"]],
        [11.5, 120, True])
     for body, want in (('{"tasks":[{"name":"甲","at":"25:00","prompt":"x","enabled":true}]}', "任务 甲 的 at"),
@@ -762,7 +877,7 @@ def self_test():
         MockChat.echo = {"ok": True}          # 旧版 car_chat.py：不认识这两个字段
         err = api.post_chat("去巡游", 0.8)
         ck("回显没这对字段 = 没接住：话虽然发出去了，立刻补一发急停",
-           [hits["stop"], "没生效" in err, "重启它" in err], [1, True, True])
+           [hits["stop"], "没生效" in err, "重启它" in err, STOPPED_MARK in err], [1, True, True, True])
         MockChat.echo = {"max_distance": 1.5}
         ck("  回显比请求大（服务端压根没压）也一样判没生效",
            [api.post_chat("去巡游", 0.8) is not None, hits["stop"]], [True, 2])
@@ -828,6 +943,131 @@ def self_test():
     ck("  白名单没生效 = 这班算发失败，记 blocked、不进等跑完的循环",
        run_once([task(allow_tools=["MapInfo"])], api, T, {}, force="T")[0][1], "post_failed")
 
+    # 14 自动续跑：目标班发的是**服务端那一句**，不是任务表里写的；跳过要说清是哪一种；循环要有刹车。
+    #    S 是假字样 —— 判据只问"发出去的是不是这一句"，cron 不许知道真句子长什么样（它也不该有）。
+    S = "【服务端下发的目标催促】"
+
+    def gchat(**over):
+        c = {"busy": False, "turns": 3, "goal_nudge": S,
+             "goal": {"text": "把北墙那一片测完", "turns_left": 5, "status": "active", "why": ""}}
+        c.update(over)
+        return c
+
+    def gtask(**over):
+        t = task(prompt=None, use_goal=True)
+        t.update(over)
+        return t
+
+    ck("目标班要发的就是服务端那一句", goal_note(gchat()), (S, None))
+    ck("  没挂目标：理由直接说清该怎么办", goal_note(gchat(goal=None))[1],
+       "现在没挂着长程目标：在页面上先立一个，或者把这条班的 use_goal 关掉")
+    ck("  目标已宣称完成：不再续跑",
+       "已经是「done」" in goal_note(gchat(goal={"status": "done", "turns_left": 0}))[1], True)
+    ck("  轮数到头：不替它续额度",
+       "轮数到头" in goal_note(gchat(goal={"status": "active", "turns_left": 0}))[1], True)
+    ck("  旧版聊天页没下发那句：也算跳过", "旧版 car_chat.py" in goal_note({"busy": False, "turns": 3})[1], True)
+    api, fired = FakeApi(chat=gchat(turns=0), text="北墙还剩 12 格"), {}
+    ck("一班真的把那句发了出去", [run_once([gtask()], api, T, fired, force="T")[0][1], api.sent],
+       ["跑完", [S]])
+    ck("  _cron_last.json 留的是这一句（事后只看它就知道 cron 发了什么）",
+       json.load(open(os.path.join(PATHS["dir"], "_cron_last.json"), encoding="utf-8"))["prompt"], S)
+    api = FakeApi(chat=gchat(goal=None, turns=0))
+    ck("  没目标：一个字都不发", [run_once([gtask()], api, T, {}, force="T")[0][1], api.sent], ["blocked", []])
+    api = FakeApi(chat={"busy": False, "turns": 0})
+    ck("  旧版聊天页：也不退回任务表那句（那种班根本没有自己那句），并说重启它",
+       [run_once([gtask()], api, T, {})[0][2][0].startswith("聊天页"), api.sent], [True, []])
+    api = FakeApi(chat=gchat(turns=0))
+    run_once([gtask()], api, T, {}, dry=True)
+    ck("  dry-run 也先查目标，且打印的就是那一句", S in open(
+        os.path.join(PATHS["dir"], "_cron.log"), encoding="utf-8").read().splitlines()[-1], True)
+
+    L = gtask(every_min=20)
+    REC3 = {"date": "2026-10-20", "state": "fired", "slot": 3}
+    ck("循环班：到点算第 0 班", due(L, T, {})[1], {"date": "2026-10-20", "state": "fired", "slot": 0})
+    ck("  同一班里每分钟调一遍只发一次（22:30~22:49 是同一班）",
+       due(L, T + dt.timedelta(minutes=19), {"date": "2026-10-20", "state": "fired", "slot": 0})[0], False)
+    ck("  过 20 分钟才换第 1 班",
+       due(L, T + dt.timedelta(minutes=20), {"date": "2026-10-20", "state": "fired", "slot": 0})[1]["slot"], 1)
+    ck("  循环窗口仍是 grace_min 那个，23:59 收口", due(L, dt.datetime(2026, 10, 20, 23, 59), REC3)[0], True)
+    ck("  跨午夜后不再发、也不喊错过（那班本来就发过了）",
+       [due(L, dt.datetime(2026, 10, 21, 0, 5), REC3)[0], due(L, dt.datetime(2026, 10, 21, 0, 5), REC3)[1]],
+       [False, None])
+    ck("  没写 every_min 的目标班还是「一天一班」：slot 恒 0",
+       [slot_index(gtask(), T, T + dt.timedelta(minutes=95)),
+        due(gtask(), T + dt.timedelta(minutes=95), REC3)[0]], [0, False])
+    ck("  every_min 只有配上 use_goal 才算循环班",
+       [loop_step(task()), loop_step(task(every_min=5)), loop_step(gtask(every_min=5))], [None, None, 5.0])
+
+    wd, globals()["wait_done"] = wait_done, (lambda a, t0, lim, **kw: ("超时已急停", {"turns": 0, "used_s": 1.0}))
+    try:
+        api, fired = FakeApi(chat=gchat(turns=0)), {}
+        run_once([L], api, T, fired, force="T")
+        ck("刹车一：上一班是被 max_minutes 掐停的 → 这个循环当天收口（fired 改 halted）",
+           [fired["T"]["state"], api.sent], ["halted", [S]])
+        ck("  halted 把当天剩下的班全部收掉", due(L, T + dt.timedelta(minutes=20), fired["T"])[0], False)
+        ck("  日志最后一行写着为什么停（人只看日志就知道循环没人接了）",
+           "到此为止" in open(os.path.join(PATHS["dir"], "_cron.log"), encoding="utf-8").read().splitlines()[-1], True)
+        api, fired = FakeApi(chat=gchat(turns=0)), {}
+        run_once([gtask()], api, T, fired, force="T")
+        ck("  只发一班的目标班超时不记 halted（本来就没有下一班要刹）", fired["T"]["state"], "fired")
+    finally:
+        globals()["wait_done"] = wd
+
+    api = FakeApi(chat=gchat(turns=0))
+    api.post_chat = lambda *a: "单次上限没生效（要 0.80 米，:8020 回显 {}）：" + STOPPED_MARK
+    fired = {}
+    ck("刹车二：闸没被回显接住 = 那句正拿全局上限跑 → 循环当天收口",
+       [run_once([L], api, T, fired)[0][1], fired["T"]["state"],
+        due(L, T + dt.timedelta(minutes=20), fired["T"])[0]], ["post_failed", "halted", False])
+    api = FakeApi(chat=gchat(turns=0))
+    api.post_chat = lambda *a: "HTTP 500：聊天页正在重启"
+    fired = {}
+    ck("  话根本没进场（HTTP 失败）不算刹车：记 blocked，下一班照发",
+       [run_once([L], api, T, fired)[0][1], fired["T"]["state"],
+        due(L, T + dt.timedelta(minutes=20), fired["T"])[0]], ["post_failed", "blocked", True])
+    api, fired = FakeApi(chat=gchat(goal=None, turns=0)), {}
+    run_once([L], api, T, fired)
+    n0 = len(open(os.path.join(PATHS["dir"], "_cron.log"), encoding="utf-8").read().splitlines())
+    run_once([L], api, T + dt.timedelta(minutes=1), fired)
+    run_once([L], api, T + dt.timedelta(minutes=20), fired)
+    ck("  没目标这一条：下一分钟不重发、下一班重试，但同一个理由不刷第二遍",
+       [api.sent, len(open(os.path.join(PATHS["dir"], "_cron.log"), encoding="utf-8").read().splitlines())],
+       [[], n0])
+
+    p = os.path.join(PATHS["dir"], "cron_tasks.json")
+    def load(body):
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"tasks": [body]}, fh, ensure_ascii=False)
+        return load_tasks(p)
+    ck("use_goal 班可以没有 prompt（话由服务端给）",
+       [load({"name": "甲", "at": "07:00", "use_goal": True, "every_min": 20})[1],
+        load({"name": "甲", "at": "07:00", "use_goal": True, "every_min": 20})[0][0]["every_min"]],
+       [None, 20.0])
+    ck("老表没写这两个字段：use_goal=False、every_min=None（行为和以前一字不差）",
+       [load({"name": "甲", "at": "07:00", "prompt": "x"})[0][0]["use_goal"],
+        load({"name": "甲", "at": "07:00", "prompt": "x"})[0][0]["every_min"]], [False, None])
+    for body, want in (({"name": "甲", "at": "07:00", "prompt": "x", "use_goal": True}, "同时写了 prompt"),
+                       ({"name": "甲", "at": "07:00", "prompt": "x", "every_min": 20}, "写了 every_min 但没写 use_goal"),
+                       ({"name": "甲", "at": "07:00", "use_goal": True, "every_min": "半小时"}, "不是分钟数"),
+                       ({"name": "甲", "at": "07:00", "use_goal": True, "every_min": 0}, "太小"),
+                       ({"name": "甲", "at": "07:00", "use_goal": "true"}, "不是 true/false"),
+                       ({"name": "甲", "at": "07:00"}, "缺 prompt")):
+        ck("  %s：当场报错，不许当没写" % want, want in (load(body)[1] or ""), True)
+
+    with open(os.path.join(HERE, "car_cron.py"), encoding="utf-8") as fh:
+        cron_src = fh.read()
+    with open(os.path.join(HERE, "car_chat_ui.html"), encoding="utf-8") as fh:
+        ui_src = fh.read()
+    m = re.search(r'GOAL_NUDGE = \("([^"]+)"', chat_src)
+    ck("能从 car_chat.py 抄出那句的头几个字（它换了写法判据就红，不许静默跳过）", m is not None, True)
+    head = (m.group(1)[:8]) if m else "GOAL-NOT-FOUND"
+    ck("那句催促全仓只有 car_chat.py 一份：页面和 cron 都不抄",
+       [head in chat_src, head in ui_src, head in cron_src], [True, False, False])
+    ck("  三方读的是同一个字段名",
+       ['"goal_nudge": GOAL_NUDGE' in chat_src, "chat.goal_nudge" in ui_src, "goal_nudge" in cron_src],
+       [True, True, True])
+    ck("  页面那个按钮没拿到那句就不许点（发空话比不发更糟）", "!nudge" in ui_src, True)
+
     print("\n%s" % ("SELF-TEST PASS" if not fails else "SELF-TEST FAIL：%s" % fails))
     return 1 if fails else 0
 
@@ -859,9 +1099,15 @@ def main():
         day = now.strftime("%Y-%m-%d")
         for t in tasks:
             rec = fired.get(t["name"]) or {}
-            mark = {"fired": "今天已发", "missed": "今天已错过", "blocked": "今天被拦"}.get(
+            mark = {"fired": "今天已发", "missed": "今天已错过", "blocked": "今天被拦",
+                    "halted": "今天已停（循环刹车）"}.get(
                 rec.get("state"), "") if rec.get("date") == day else ""
-            print("%-14s %-6s %-42s %s" % (t["name"], t["at"], next_note(t, now), mark))
+            if mark == "今天已发" and loop_step(t) is not None:
+                mark += "第 %s 班" % (rec.get("slot") or 0)
+            sends = ("发服务端那句目标催促" if t["use_goal"] else "发：%s" % str(t.get("prompt"))[:40])
+            if loop_step(t) is not None:
+                sends += " · 循环刹车：超时或闸没接住就当天收口"
+            print("%-14s %-6s %-42s %s\n               %s" % (t["name"], t["at"], next_note(t, now), mark, sends))
         return 0
     api, fired = HttpApi(), load_fired()
     while True:

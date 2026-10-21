@@ -108,6 +108,20 @@ SCAN_SIGN = 1.0
 SCAN_SWEEP = 1.0 / 15.0               # s for a full 360 sweep; /scan publishes at ~15 Hz
 PROTOCOL_VERSION = "2025-03-26"
 
+# Move(direction="arc_left"/"arc_right"). The fan the clearance check looks through is moved to the
+# side the car is bending toward, because the next metre of a curve is not off the nose.
+ARC_LOOK_DEG = 30.0
+# How far the swept angle may disagree with (arc length / radius) before the "arc" is called what
+# it is: a flat path. Both numbers come from the same odometer, so on a real arc they agree to a
+# couple of degrees -- the slack is the ±5 cm position quantisation and a sampled tick, not model
+# uncertainty. A wide tolerance here is exactly what lets "it drove 0.3 m of straight line" pass.
+ARC_SWEEP_TOL_DEG = 12.0
+ARC_SWEEP_TOL_FRAC = 0.35         # ... plus this share of the expected sweep, for long arcs
+ARC_STRAIGHT_FRAC = 0.4               # share of ticks whose curvature ask fell in the dead band
+# ... and the floor that keeps them out of it: nav.arc_min_speed() is the mathematical limit, and
+# driving right at a limit is driving where one rounding step means "this tick goes straight".
+ARC_TAIL_MARGIN = 1.15
+
 
 def stalled(want, got, win, kind):
     """True when a window of commanded motion bought no movement worth the name.
@@ -523,6 +537,217 @@ class Car(Node):
 
     def turn(self, angle_deg, speed):
         return self._closed_loop("angular", math.radians(angle_deg), speed)
+
+    def arc(self, radius, distance, side, speed):
+        """Drive `distance` metres along a circle of `radius` metres, curving toward `side`.
+
+        Two rulers again, and this time they measure different things: the odometer can count
+        metres the room never saw (slipping), and the car can travel every one of those metres
+        while going straight -- because the curvature command fell into the band the wheels ignore,
+        or because the radius asked for is outside what `nav.arc_band` says this chassis can draw.
+        Geometry ties the two together (swept angle = arc length / radius), so a curve that is
+        really a straight line shows up as a disagreement rather than as a clean pass, and this is
+        the case an open-loop `w = v/R` would have folded into the map at a heading the car never had.
+
+        Not covered here, on purpose: reversing along an arc, and the ring-behind slip witness
+        `_closed_loop` uses -- that ruler reads the wall astern, and a curving car's stern swings
+        through it, so it would have to be re-derived before it means anything.
+        """
+        need = abs(float(distance))
+        rad = abs(float(radius))
+        side = 1.0 if float(side) >= 0.0 else -1.0     # +1 = 向左弯（逆时针）
+        if need <= 0.0:
+            return True, "弧线距离 0 米，没动"
+        r_min, r_max = nav.arc_band(speed)
+        if rad > r_max or rad < r_min:
+            which = ("太缓：这条实际会走成直线，要直走请用 direction=forward"
+                     if rad > r_max else
+                     "太急：转角命令已经到上限还是弯不过来，把半径放大或调低 --linear-speed")
+            self.last_error = "半径 %.2f m 画不出来（命令 %.2f m/s 时能稳住的圆是 %.2f ~ %.2f m）：%s" % (
+                rad, speed, r_min, r_max, which)
+            return False, self.last_error
+        with self.lock:
+            if self.pose is None:
+                self.last_error = "没有收到 %s 数据" % ODOM_TOPIC
+                return False, self.last_error
+            x0, y0, yaw0, t0 = self.pose
+        if t0 is not None and time.monotonic() - t0 > 3.0:
+            self.last_error = "%s 已停滞 %.1f 秒，检查车是否在线" % (
+                ODOM_TOPIC, time.monotonic() - t0)
+            return False, self.last_error
+
+        # The reference circle is fixed once, from the pose this command started at. Re-deriving it
+        # every tick would be "wherever the car says it is, that is the circle", and the feedback
+        # would then chase the odometer's own drift into a spiral and call it progress.
+        cx = x0 - side * rad * math.sin(yaw0)
+        cy = y0 + side * rad * math.cos(yaw0)
+
+        travelled = 0.0          # m of arc, summed along the path -- not the chord
+        sw_odom = 0.0            # rad swept, signed in the commanded sense
+        sw_gyro = 0.0            # ... and the same quantity from a sensor that ignores the wheels
+        # The curvature witness compares INCREMENTS, not totals: an escape manoeuvre backs the car
+        # up and twists it, which moves both totals in ways the circle never promised, and the first
+        # such attempt would then be reported as "it drifted straight" instead of what it was.
+        s_base = 0.0
+        sw_base = 0.0
+        prev = (x0, y0)
+        prev_yaw = yaw0
+        err = need
+        v = w = 0.0
+        straight_ticks = 0
+        ticks = 0
+        tries = 0
+        extra_m = 0.0
+        notes = []
+        rate_t0 = t_start = time.monotonic()
+        rate_ref = 0.0
+        gyro_prev = None
+        deadline = time.monotonic() + self.args.move_timeout
+        ok = False
+        self.acting = True
+        self.abort_reason = ""
+        self.nav_stop = False
+        self.stop_src = ""
+        try:
+            while time.monotonic() < deadline and rclpy.ok():
+                if self.abort_reason:
+                    self.last_error = self.abort_reason
+                    return False, self.last_error
+                if self.nav_stop:
+                    if self.stop_src == "machine":
+                        self.last_error = "机器判定中止（弧线已完成 %.2f/%.2f 米）" % (travelled, need)
+                    else:
+                        self.last_error = "收到停止指令（弧线已完成 %.2f/%.2f 米）" % (travelled, need)
+                    return False, self.last_error
+                with self.lock:
+                    cur, im = self.pose, self.imu
+                if cur is None:
+                    self.last_error = "弧线途中没有里程计数据"
+                    return False, self.last_error
+                x, y, yaw = cur[0], cur[1], cur[2]
+                travelled += math.hypot(x - prev[0], y - prev[1])
+                sw_odom += side * wrap_pi(yaw - prev_yaw)
+                prev, prev_yaw = (x, y), yaw
+                ticks += 1
+                d_s = travelled - s_base
+                d_sw = sw_odom - sw_base
+                if ticks > 3 and d_s > 0.15:
+                    # The curvature witness. A left arc of radius R that covers s metres must have
+                    # turned s/R radians; if it has not, the metres went into a path that is flatter
+                    # than the one that was asked for, and every number in the reply would lie.
+                    exp_sw = d_s / rad
+                    if abs(exp_sw - d_sw) > math.radians(ARC_SWEEP_TOL_DEG) + \
+                            ARC_SWEEP_TOL_FRAC * exp_sw:
+                        real_r = d_s / max(abs(d_sw), 1e-6)
+                        self.last_error = ("车没照命令的半径弯：这段走了 %.2f m 只转过 %.0f°，实际半径约 %.1f m"
+                                           "（命令 %.2f m）——已中止，这段别拿去建图，也别原样重发；"
+                                           "先看是不是半径要求落在轮子不转的带宽里，或车被顶住只能直走" % (
+                                               d_s, math.degrees(d_sw), real_r, rad))
+                        return False, self.last_error
+                err = need - travelled
+                if err <= max(0.02, 0.04 * need):
+                    ok = True
+                    break
+                # A curve's next metre is not in front of the nose: it is on the side it is bending
+                # toward, so the clearance fan moves with the sign of the turn.
+                clear = self.window_min(side * ARC_LOOK_DEG, 40.0)
+                if clear is not None and clear < self.args.safe_distance:
+                    self.last_error = ("行进方向（%s %.0f°）%.2f m 内有障碍，已中止（完成 %.2f/%.2f 米）" % (
+                        "左前" if side > 0 else "右前", ARC_LOOK_DEG, clear, travelled, need))
+                    return False, self.last_error
+                # An arc's tail cannot ease down the way a straight run does: below `arc_min_speed`
+                # the curvature this circle asks for needs a turn command inside the dead band, and
+                # `arc_plan` rightly refuses it -- so the last centimetres would go straight, which
+                # is both a wrong path and a false curvature alarm. The margin is not slack for its
+                # own sake: at the bare limit the wheels sit exactly on the cut-on, so one rounding
+                # step either way spends the tick going straight and leaves no authority to correct.
+                v = max(tail_cmd("linear", speed, err, need),
+                        min(speed, ARC_TAIL_MARGIN * nav.arc_min_speed(rad)))
+                w, _kappa, straight = nav.arc_plan(rad, math.hypot(x - cx, y - cy) - rad, v, side)
+                straight_ticks += 1 if straight else 0
+                self.drive(v, w)
+                time.sleep(CMD_PERIOD)
+                now = time.monotonic()
+                with self.lock:
+                    im = self.imu
+                if im is not None and now - im[1] < 0.5:
+                    if gyro_prev is not None:
+                        sw_gyro += side * im[0] * max(0.0, min(0.3, im[1] - gyro_prev))
+                    gyro_prev = im[1]
+                if travelled - rate_ref > STALL_MIN_M and not straight:
+                    rate_t0, rate_ref, gyro_prev = now, travelled, None
+                    continue
+                win = now - rate_t0
+                if win < STALL_SECS or now - t_start < STALL_GRACE:
+                    continue
+                exp_v, _exp_w = nav.achieved(v, w)
+                got = (travelled - rate_ref) / win
+                if stalled(exp_v, got, win, "linear"):
+                    label, parts = self._why_stalled("linear", side, abs(sw_gyro), win)
+                    if tries >= ESCAPE_TRIES or extra_m >= ESCAPE_BACK:
+                        if tries:
+                            self.last_error = ("弧线走不动了（命令 %.2f m/s，实测 %.2f m/s，%.1f s 没进展）："
+                                               "%s。已自动试了 %d 次脱困（%s）还是不通，停下来等人工处理" % (
+                                                   exp_v, got, win, "；".join(parts), tries, "，".join(notes)))
+                        else:
+                            self.last_error = "弧线走不动了（命令 %.2f m/s，实测 %.2f m/s）：%s" % (
+                                exp_v, got, "；".join(parts))
+                        return False, self.last_error
+                    tries += 1
+                    note, moved = self._escape("linear", side, tries, speed, label)
+                    notes.append("第%d次脱困：%s" % (tries, note))
+                    extra_m += moved
+                    # Re-base both rulers on where the escape left the car, and refuse to bank the
+                    # back-off as arc progress: the car did not gain 0.14 m of curve by losing it.
+                    with self.lock:
+                        cur = self.pose
+                    if cur is not None:
+                        prev, prev_yaw = (cur[0], cur[1]), cur[2]
+                    travelled = max(0.0, travelled - moved)
+                    s_base, sw_base = travelled, sw_odom
+                    rate_t0, rate_ref, gyro_prev = time.monotonic(), travelled, None
+        finally:
+            self.acting = False
+            self.stop_stream(0.4)
+
+        if ok:
+            # The board keeps its own motion queue, so the car travels and turns a little past the
+            # tick the loop let go. Bill what it actually did -- and only until the pose stops moving.
+            deadline = time.monotonic() + 2.0
+            last = travelled
+            while time.monotonic() < deadline:
+                time.sleep(0.25)
+                with self.lock:
+                    cur = self.pose
+                if cur is None:
+                    break
+                travelled += math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+                sw_odom += side * wrap_pi(cur[2] - prev_yaw)
+                prev, prev_yaw = (cur[0], cur[1]), cur[2]
+                if travelled - last < 0.003:
+                    break
+                last = travelled
+        doubt = []
+        if sw_odom > 0.1 and abs(sw_odom - sw_gyro) > math.radians(SLIP_YAW_DEG):
+            doubt.append("里程计朝向与陀螺差到 %.0f°，这段的朝向和位移都别当真" %
+                         math.degrees(abs(sw_odom - sw_gyro)))
+        if straight_ticks > ARC_STRAIGHT_FRAC * max(ticks, 1):
+            doubt.append("有 %.0f%% 的拍子半径要求落进轮子不转的带宽里，这一整段其实是在边走边直走" % (
+                100.0 * straight_ticks / max(ticks, 1)))
+        doubt = ("；注意：" + "，".join(doubt)) if doubt else ""
+        real_r = travelled / max(abs(sw_odom), 1e-6) if travelled > 0.05 else 0.0
+        did = ("；中途受阻 %d 次（%s）" % (tries, "，".join(notes))) if notes else ""
+        tail = "已完成弧线 %.2f/%.2f 米（半径 %.2f m %s，实测 %.2f 米、扫过 %.0f°、实际半径约 %.2f m）%s%s" % (
+            travelled, need, rad, "向左" if side > 0 else "向右", travelled,
+            math.degrees(abs(sw_odom)), real_r, did, doubt)
+        if ok:
+            return True, tail
+        spent = max(0.1, time.monotonic() - t_start)
+        self.last_error = ("弧线超时未完成（%.2f/%.2f 米，%.1f s 内平均 %.2f m/s），没触发停滞判定说明车在动只是慢；"
+                           "已试脱困 %d 次%s%s。下一步建议：ScanRing 看环视、MapInfo 换目标，或 Stop 后人工检查" % (
+                               travelled, need, spent, travelled / spent, tries,
+                               ("（%s）" % "，".join(notes)) if notes else "", doubt))
+        return False, self.last_error
 
     def drive_tour(self, budget, out_dir="", world=None, trail=None):
         """Walk the room's outline while mapping it, and stop where the mapping began.
@@ -1307,19 +1532,36 @@ def build_server(car, args):
     mcp = McpServer("microros_v2_pc")
     cache = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
     os.makedirs(cache, exist_ok=True)
+    band = nav.arc_band(args.linear_speed)      # 写进工具描述，别让模型照一份写死的半径带规划
 
     @mcp.tool(description=(
-        "Move the chassis by odometry feedback. direction: forward | backward | "
-        "turn_left | turn_right. Linear moves use distance (metres), turns use "
-        "angle (positive degrees). Keep each call small: <=0.5 m or <=90 deg. "
+        "Move the chassis by odometry feedback. direction: forward | backward | turn_left | "
+        "turn_right | arc_left | arc_right. Linear moves use distance (metres), turns use "
+        "angle (positive degrees). Arcs curve while they travel: distance is the metres "
+        "travelled ALONG the curve and radius (metres) is how sharp it bends -- at this "
+        "car's --linear-speed the only radii it can actually hold are %.2f to %.2f m, so "
+        "start around 0.5 m, and one circle needs several calls because each is capped by the "
+        "single-move distance limit. An arc aborts if the metres travelled and the angle swept "
+        "stop agreeing, which is how it detects that it drifted straight instead of curving. "
+        "Keep each call small: <=0.5 m or <=90 deg. "
         "Linear moves abort on their own when the lidar sees the corridor close in. "
         "If the wheels are driven but the car stops making progress for ~1.6 s it aborts early, "
         "says which sense (lidar / map / gyro) calls it 被挡住 versus 打滑或被线拽住, and tries one "
         "bounded escape -- back off when astern is clear, twist the other way for a turn -- before "
         "failing. The failure text names the diagnosis, what it tried, and the next move; read it "
-        "instead of retrying the same command."))
-    def Move(direction: str, distance: float = 0.0, angle: float = 0.0) -> str:
+        "instead of retrying the same command." % (band[0], band[1])))
+    def Move(direction: str, distance: float = 0.0, angle: float = 0.0,
+             radius: float = 0.0) -> str:
         d = (direction or "").strip().lower()
+        if d in ("arc_left", "arc_right"):
+            r = float(radius)
+            if r <= 0.0:
+                return ("失败: %s 还要带 radius（米，正数）。这一轮车能稳住的半径是 %.2f ~ %.2f m，"
+                        "先按 %.2f m 试；distance 是沿弧线走的米数，不是弦长" % (
+                            d, band[0], band[1], (band[0] + band[1]) / 2.0))
+            ok, msg = car.arc(r, abs(float(distance)), 1.0 if d == "arc_left" else -1.0,
+                              args.linear_speed)
+            return ("成功: " if ok else "失败: ") + msg
         if d == "forward":
             ok, msg = car.move_linear(abs(float(distance)), args.linear_speed)
         elif d == "backward":
@@ -1329,7 +1571,8 @@ def build_server(car, args):
         elif d == "turn_right":
             ok, msg = car.turn(-abs(float(angle)), args.angular_speed)
         else:
-            return "失败: direction 只能是 forward/backward/turn_left/turn_right"
+            return ("失败: direction 只能是 forward/backward/turn_left/turn_right/"
+                    "arc_left/arc_right")
         return ("成功: " if ok else "失败: ") + msg
 
     @mcp.tool(description=(

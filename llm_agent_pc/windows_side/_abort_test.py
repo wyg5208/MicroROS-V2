@@ -9,7 +9,7 @@ hand -- the corruption is injected the same way a real carry would show up (the 
 place, the lidar says another), and recovery is expected to be the machine's own: the abort stops
 the car, then the stopped-car detector gets a standing sweep and relocates back.
 
-Run: python _abort_test.py            (plain python: HTTP + the MCP endpoint only)
+Run: python _abort_test.py drives [forward|backward] [米数]   （不给 drives 直接退出码 2，一个字都不发）
 """
 import json
 import math
@@ -21,6 +21,11 @@ import time
 import urllib.request
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+from drives_gate import require_drives  # noqa: E402
+
+require_drives("连发几条 MCP Move（默认 forward 1.10 m），中途用 /api/reloc 注入假位姿，"
+               "事后只还原它自己读到的那一份 bias")
 
 WEB = "http://127.0.0.1:8010"
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_console")

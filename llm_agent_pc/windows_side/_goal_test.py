@@ -57,12 +57,18 @@ SCRIPT = {"reply": "", "texts": [], "block": None, "boom": None}
 
 
 def fake_run_turn(cfg, mcp, tools_spec, name_map, messages, user_text):
-    """顶掉 agent.run_turn：把要发往模型的那句话留着，并脚本好这一轮的回答。"""
+    """顶掉 agent.run_turn：把要发往模型的那句话留着，并脚本好这一轮的回答。
+
+    要留的不止这一句：闸的旁白是**存进 messages 才算数**的（下一轮读的是历史），
+    所以照真循环那样把 user/assistant 两条也压进去，否则跨轮那几节是空的。
+    """
     SCRIPT["texts"].append(user_text)
+    messages.append({"role": "user", "content": user_text})
     if SCRIPT["block"] is not None:
         SCRIPT["block"].wait(8.0)
     if SCRIPT["boom"] is not None:
         raise SCRIPT["boom"]
+    messages.append({"role": "assistant", "content": SCRIPT["reply"]})
     cfg.hooks.event({"type": "assistant", "text": SCRIPT["reply"]})
 
 
@@ -143,7 +149,7 @@ ck("A6 没设目标时两道闸照旧按天花板走（目标不参与它们的�
 turn(s, "去看一眼", max_distance=0.5)
 ck("A5 压了逐轮上限、没压目标时，追加的只有那一句上限（顺序也没变）",
    [SCRIPT["texts"][-1].startswith("去看一眼"),
-    SCRIPT["texts"][-1].count("[本轮单次动作上限"), "长程目标" in SCRIPT["texts"][-1]],
+    SCRIPT["texts"][-1].count(car_chat.GATE_NOTE), "长程目标" in SCRIPT["texts"][-1]],
    [True, 1, False])
 
 # ============ B 注入：目标是「重述」，不是「替人说话」 ============
@@ -361,6 +367,7 @@ ck("F17 跑完那一轮也没朝目标记账（目标半路被清掉，账不能
 
 # ============ G 跨文件对账：页面发的字段、事件名、暗号字样 ============
 CC_TXT = io.open(os.path.join(ROOT, "car_chat.py"), encoding="utf-8").read()
+AGENT_TXT = io.open(os.path.join(ROOT, "agent.py"), encoding="utf-8").read()
 HTML = io.open(os.path.join(ROOT, "car_chat_ui.html"), encoding="utf-8").read()
 branch = re.search(r'if path == "/goal":(.*?)if path == "/reset":', CC_TXT, re.S)
 ck("G1 /goal 那段路由读得出来（读不到这份判据就是空的）", bool(branch), True)
@@ -385,11 +392,20 @@ ck("G8  上限常数没抄进页面（30 只在服务端；页面填超了由服
    ["GOAL_MAX" in HTML, 'placeholder="30"' in HTML], [False, False])
 ck("G9 「按目标再跑一轮」发的是 /chat，不是一条新通道",
    [HTML.count('post("/chat"') >= 2, "runGoalTurn" in HTML], [True, True])
-ck("G10 那一句是常量，且忙或没有 active 目标时点不动",
-   ["const GOAL_NUDGE" in HTML, "busy || !on" in HTML], [True, True])
-nudge = re.search(r'const GOAL_NUDGE = "([^"]+)"', HTML)
+ck("G10 那句催促已经不住在页面里了（字样只从 chat.goal_nudge 拿）",
+   [car_chat.GOAL_NUDGE in HTML, "chat.goal_nudge" in HTML], [False, True])
 ck("G11 这句催促里不许出现工具名或距离（它是给人看的一句话，不是绕过闸的路）",
-   any(w in nudge.group(1) for w in ("Move", "Tour", "米", "度")), False)
+   any(w in car_chat.GOAL_NUDGE for w in ("Move", "Tour", "米", "度")), False)
+ck("G12 服务端把这句话经 /state 下发（页面和 car_cron 读的是同一格）",
+   '"goal_nudge": GOAL_NUDGE' in CC_TXT, True)
+CRON_TXT = io.open(os.path.join(ROOT, "car_cron.py"), encoding="utf-8").read()
+ck("G13 car_cron 同样不抄那句：它读 chat.goal_nudge，句子一个字都不写在自己里",
+   [car_chat.GOAL_NUDGE in CRON_TXT, "goal_nudge" in CRON_TXT, "use_goal" in CRON_TXT],
+   [False, True, True])
+ck("G14 页面那个按钮没拿到那句就不许点、也不发（发空话比不发更糟）",
+   ["!nudge" in HTML, "busy || !on || !nudge" in HTML], [True, True])
+ck("G15 循环刹车认的记号只有一份常数，post_chat 和 run_once 都用它（不许另造一套字样）",
+   [CRON_TXT.count("STOPPED_MARK = ") == 1, CRON_TXT.count("STOPPED_MARK") >= 4], [True, True])
 
 # ============ H 页面交出去的是数字还是字符串（迭代 13 那个 400 的教训） ============
 node = shutil.which("node")
@@ -432,6 +448,57 @@ else:
     ck("H6  空目标不发出去，而且当场说清为什么", [js, any("空的" in n for n in notes)], [None, True])
     ck("H7  99 轮页面照发（上限是服务端的常数）：由它 400，再由页面把那句念给人看",
        types_of(run_js({"goalText": "x", "goalTurns": "99"})[0]), {"text": "str", "max_turns": "int"})
+
+# ============ I 逐轮闸的旁白不许漏到下一轮 ============
+# 放这一节是因为它是**跨轮**的：闸本身每轮从 caps 重算（A6 那条管得住一轮之内），
+# 但写进人那句话的旁白存进了 messages，下一轮还在。2026-10-21 真机 :8020/history：
+# 只读班（0 米 + 只许 MapInfo/GetStatus）之后的"走正方形 3 圈"明明恢复了天花板，
+# 模型读着自己历史里那句"压到 0.00 米"回答"无法执行"，整轮站着没动，要人再发一句"解除上限"。
+s = fresh()
+t_press = turn(s, "只读报一遍", max_distance=0, allow_tools=["MapInfo", "GetStatus"])
+users = lambda: [m for m in s.messages if m["role"] == "user"]
+ck("I1 压闸那一轮存进历史的就是带旁白的那句（前提，不成立下面几条都是空的）",
+   [t_press.count(car_chat.GATE_NOTE), len(users())], [2, 1])
+ck("I2  旁白只往人那句话末尾加，人写的字没被动过", t_press.startswith("只读报一遍"), True)
+t_next = turn(s, "走正方形三圈")
+ck("I3 下一轮（没压闸）发出去的那句里，一个字的旧闸都不许剩", car_chat.GATE_NOTE in t_next, False)
+ck("I4 历史里那两句标成已作废、本轮不再有待生效的闸（划掉不是删掉，人还能回看上一句被限过）",
+   [sum(m["content"].count(car_chat.GATE_NOTE_OLD) for m in users()),
+    sum(m["content"].count(car_chat.GATE_NOTE) for m in users())], [2, 0])
+ck("I5  恢复天花板时补一句本轮的现值，模型读到的最后一句是这一轮的数",
+   [t_next.startswith("走正方形三圈"), car_chat.GATE_NOTE_OLD in t_next,
+    "1.50 米 / 90 度" in t_next], [True, False, True])
+gs = [e for e in events(s, "gate_notes")]
+ck("I6 作废这件事发得出事件（只靠模型嘴上说本轮 1.5 米就是又回到自述）",
+   [(e["type"], e["n"]) for e in gs], [("gate_notes_expired", 2)])
+ck("I7  事件带本轮生效值，页面不必再去别处拼",
+   [gs[0]["now"]["max_distance"], gs[0]["now"]["max_angle"], gs[0]["now"]["allow_tools"]],
+   [1.5, 90.0, None])
+ck("I8 页面有这一条的渲染分支（发得出但看不见等于没发生）",
+   'case "gate_notes_expired"' in HTML, True)
+t_again = turn(s, "再来一班只读", max_distance=0.4)
+ck("I9 新一轮自己压闸时旧闸同样作废，一句里不许同时有两个上限",
+   [t_again.count(car_chat.GATE_NOTE), car_chat.GATE_NOTE_OLD in t_again,
+    sum(car_chat.GATE_NOTE in m["content"] for m in users())], [1, False, 1])
+
+# ============ J 一轮的步数上限：一个数、装得下实测那条长指令 ============
+LAUNCH = ("启动智能体.bat", "启动聊天页面.bat", "_relaunch_chat.ps1")
+ck("J0 三份启动脚本读得到（读不到 J1 就是空的）",
+   len([n for n in LAUNCH if os.path.exists(os.path.join(ROOT, n))]), 3)
+ck("J1  启动脚本里没有第二个 --max-steps（两处不一致时人只能猜哪个生效；这数只住在 agent.py 默认值）",
+   ["--max-steps" in io.open(os.path.join(ROOT, n), encoding="utf-8", errors="replace").read()
+    for n in LAUNCH], [False] * len(LAUNCH))
+steps = vars(agent.build_argparser().parse_args([]))["max_steps"]
+ck("J2 默认步数装得下实测那句「0.5 米边长正方形 3 圈」：24 次 Move + 1 次受阻 + 1 次脱困 = 27 步",
+   steps >= 27, True)
+ck("J3 撞上限时把是哪个数说了出来（页面和控制台都念得出，不让人猜）",
+   ['{"type": "limit", "max_steps": cfg.max_steps}' in AGENT_TXT, "ev.max_steps" in HTML],
+   [True, True])
+ck("J4  真 /state 那一格带着本轮步数上限：F 组那个会话的 cfg 是 4，读出来就得是 4（证明它来自 cfg，不是页面抄的数）",
+   [http_get(base, "/state")["chat"].get("max_steps"), "chat.max_steps" in HTML], [4, True])
+ck("J5  自动班那侧也没有第二个步数旋钮（任务表写了不认的字段会被**安静忽略**，那是最坏的一种）",
+   ["max_steps" in CRON_TXT, "max_steps" in io.open(os.path.join(ROOT, "cron_tasks.json"),
+                                                    encoding="utf-8").read()], [False, False])
 
 for srv in srv_box:
     srv.shutdown()
