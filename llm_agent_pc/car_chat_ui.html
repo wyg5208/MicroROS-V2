@@ -171,6 +171,7 @@ function onEvent(ev){
     }
     case "cancelled": msg("note", "已取消", ev.tool + " 没有被执行（你点了拒绝或确认超时）"); break;
     case "auto_denied": msg("note", "自动拒绝", ev.tool + " 没有下发：本轮已经拒绝过一次，模型再请求也不会重新问你。想继续就重新说一句指令。"); break;
+    case "blocked": msg("note", "白名单拦下", ev.tool + " 没有被执行：这一轮只允许白名单里的工具，命令没有下发给车。这一轮的闸可以在 :8020/state 的 chat.gates 里核对。"); break;
     case "approval": makeCard(ev); break;
     case "approval_decided":
     case "approval_expired": killCard(ev.id, ev.type === "approval_expired" ? "超时，默认拒绝" : (ev.allow ? "已允许" : "已拒绝")); break;

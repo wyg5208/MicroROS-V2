@@ -351,6 +351,23 @@ def _num(v):
     return max(0.0, float(v))
 
 
+def _tools(v):
+    """请求体里的工具白名单：返回 (规范化列表或 None, 错误文本)。
+
+    None 是"没给"（不限，行为与从前一样），`[]` 是"一个都不许调" —— 这俩必须分得开，
+    所以写成别的类型不当"没给"处理：静默忽略比拒绝危险（同 `max_distance` 那条）。
+    """
+    if v is None:
+        return None, ""
+    if not isinstance(v, list) or any(not isinstance(x, str) or not x.strip() for x in v):
+        return None, "allow_tools 必须是工具名的字符串列表（空列表=这一轮什么都不许调）"
+    out = []
+    for x in v:
+        if x.strip() not in out:
+            out.append(x.strip())
+    return out, ""
+
+
 class Session:
     """一条对话 + 一次只允许一个动作回合 + 一把要人点头的确认闸。"""
 
@@ -361,6 +378,9 @@ class Session:
         # 启动时那对 --max-distance/--max-angle 是**天花板**：逐轮上限只许往下压，
         # 传个更大的数字不能把车放出界（网页和定时任务都是客人，不是房主）。
         self.caps = (abs(float(cfg.max_distance)), abs(float(cfg.max_angle)))
+        # 这一轮真的生效的那三样，挂在会话上给 `:8020/state` 读 —— 页面右上角和 `_cron` 的
+        # 事后核对都看它，不靠"我记得我发过什么"。
+        self.gates = {"max_distance": self.caps[0], "max_angle": self.caps[1], "allow_tools": None}
         self.messages = [{"role": "system", "content": agent.system_prompt(cfg)}]
         self.busy = False
         self.turns = 0
@@ -491,8 +511,9 @@ class Session:
         return None
 
     # ---------- 回合 ----------
-    def start_turn(self, text, confirm=False, max_distance=None, max_angle=None):
-        """开一轮。逐轮上限只许往下压，返回这轮**真的生效**的那对数（回显给人核对）。"""
+    def start_turn(self, text, confirm=False, max_distance=None, max_angle=None,
+                   allow_tools=None):
+        """开一轮。逐轮上限只许往下压，返回这轮**真的生效**的那三样（回显给人核对）。"""
         if self.busy:
             raise Busy("上一条指令还在执行，先等它结束或点急停")
         self.busy = True
@@ -505,13 +526,22 @@ class Session:
         if a is not None:
             ang = min(ang, a)
         self.cfg.max_distance, self.cfg.max_angle = dist, ang
+        # 白名单没有"天花板"可压：它只在写的那一轮存在，所以每轮都得重新赋值，
+        # 上一班的 `["MapInfo"]` 漏到这一班就是把人的手动指令拦死了。
+        self.cfg.allow_tools = allow_tools
+        self.gates = {"max_distance": dist, "max_angle": ang, "allow_tools": allow_tools}
         if (dist, ang) != self.caps:
             # 提示词里那对数是全局上限，改不了；这里补一句本轮的，否则它会按全局去规划，
             # 然后每条 Move 都被截断 —— 车走的和它说的就对不上。
             text += "\n\n[本轮单次动作上限压到 %.2f 米 / %.0f 度，超过这个数的部分会被截断；" \
                     "要更远就分成几步]" % (dist, ang)
+        if allow_tools is not None:
+            # 同上：提示词里写着全部 15 个工具，不补这一句它就会照常去调 Tour，
+            # 然后每一步都收到一句"没执行"，一轮空转。
+            text += "\n\n[本轮只允许调用这些工具：%s；其余调用会被当场拦下、不会下发给车。" \
+                    "Stop 不受此限制]" % ("、".join(allow_tools) if allow_tools else "（一个都不许）")
         threading.Thread(target=self._run, args=(text,), daemon=True).start()
-        return dist, ang
+        return dist, ang, allow_tools
 
     def _run(self, text):
         try:
@@ -684,6 +714,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.sse()
         if path == "/state":
             return self._send(200, {"chat": {"busy": s.busy, "turns": s.turns,
+                                              "gates": s.gates,
                                               "pending": [s._approval_payload(r, a)
                                                           for r, a in s.pending.items()]},
                                     "voice": {"asr": self.asr.info(), "tts": self.speaker.info()},
@@ -749,11 +780,24 @@ class Handler(BaseHTTPRequestHandler):
                        if body.get(k) is not None and _num(body.get(k)) is None]
                 if bad:
                     return self._send(400, {"error": "%s 必须是数字（米 / 度）" % "、".join(bad)})
-                dist, ang = s.start_turn(text, bool(body.get("confirm")),
-                                         body.get("max_distance"), body.get("max_angle"))
+                tools, err = _tools(body.get("allow_tools"))
+                if err:
+                    return self._send(400, {"error": err})
+                if tools:
+                    # 写错一个字母的白名单比不设更坏：那一条永远匹配不上，
+                    # 于是"只读班"变成"什么都调不动"，日志里还写着放行了两个。
+                    known = set(s.name_map.values())
+                    unknown = [t for t in tools if t not in known]
+                    if unknown:
+                        return self._send(400, {"error": "本轮白名单里有不认识的工具名：%s"
+                                                    % "、".join(unknown)})
+                dist, ang, tools = s.start_turn(text, bool(body.get("confirm")),
+                                                body.get("max_distance"), body.get("max_angle"),
+                                                tools)
                 # 回显**生效**的那对数：调用方传了个比天花板还大的值，这里给的是天花板，
-                # 它对不上的那一刻就是"我以为压住了其实没压"。
-                return self._send(202, {"ok": True, "max_distance": dist, "max_angle": ang})
+                # 它对不上的那一刻就是"我以为压住了其实没压"。白名单同理。
+                return self._send(202, {"ok": True, "max_distance": dist, "max_angle": ang,
+                                        "allow_tools": tools})
             if path == "/speak":
                 if not self._same_origin():
                     return self._send(403, {"error": "拒绝跨站请求"})

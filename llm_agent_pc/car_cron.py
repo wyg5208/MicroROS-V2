@@ -31,6 +31,11 @@
 最后那对 `max_distance` / `max_angle` 是**这一班的单次动作上限**：不写就沿用聊天页启动时的
 全局上限（`--max-distance 1.5 --max-angle 90`），写了只能往更小压，且发出去后要核对 :8020
 的回显 —— 回显对不上（多半是聊天页还在跑不认识这两个字段的旧版）就当场急停，不拿"我以为压住了"当证据。
+
+`allow_tools` 是**这一班的工具白名单**（工具名列成数组，`["MapInfo", "GetStatus"]`）：不在名单里的
+工具调用会在服务端被拦下，**根本不发给车**。上限管的是"这一步别走太远"，白名单管的才是"这一班根本
+不该动车"，两者互补 —— 只读汇报那种任务要的是后者。`Stop` 不受名单限制（任何时候都能停），
+人那一侧的急停更不经过这里。同样要核对回显，回显里没有这个字段就当场急停。
 """
 import argparse
 import datetime as dt
@@ -48,7 +53,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # 默认值一律取保守的一侧：宁可少跑一班，也不要在车不在线、地图是空的、或者它自己都在怀疑位置的时候跑。
 DEFAULTS = {"min_volts": 11.5, "max_minutes": 10.0, "grace_min": 120,
             "require_map": True, "min_agree": 0.80, "max_odom_age": 2.0,
-            "days": None, "enabled": False, "max_distance": None, "max_angle": None}
+            "days": None, "enabled": False, "max_distance": None, "max_angle": None,
+            "allow_tools": None}
 TEMPLATE = {"tasks": [{"name": "晚间断头巡游", "at": "22:30", "days": [0, 1, 2, 3, 4],
                        "prompt": "先看 MapInfo，把剩下的未测格用 Tour 走掉；每次 Move 不要超过 1.0 米",
                        "max_distance": 1.0, "enabled": False}]}
@@ -96,6 +102,17 @@ def load_tasks(path=None):
                 # 写了就必须是数：把它当没写，发出去的那句话就拿全局上限跑，
                 # 而日志里还写着"这班压到 0.8 米"—— 那比不压更糟。
                 return out, "任务 %s 的 %s 不是数：%r（不写就留空，别写错的字）" % (t["name"], key, item.get(key))
+        if t["allow_tools"] is not None:
+            v = t["allow_tools"]
+            # 和那对数同一个道理：写错了不能当"没写"。当没写=这一班拿全套 15 个工具跑，
+            # 而日志里还写着"只许 MapInfo"，那正是本任务最怕的那件事。
+            if not isinstance(v, list) or any(not isinstance(x, str) or not x.strip() for x in v):
+                return out, "任务 %s 的 allow_tools 不是工具名的列表：%r（不限制就整条别写）" % (t["name"], v)
+            keep = []
+            for x in v:
+                if x.strip() not in keep:
+                    keep.append(x.strip())
+            t["allow_tools"] = keep
         try:
             parse_at(t["at"])
         except ValueError as exc:
@@ -195,6 +212,36 @@ def caps_applied(echo, max_distance, max_angle):
     return True
 
 
+def gate_note(task):
+    """日志里那句"这班带了哪些闸"：上限 + 白名单，都没写就是空串。"""
+    bits = []
+    note = caps_note(task)
+    if note:
+        bits.append("单次上限 " + note)
+    allow = task.get("allow_tools")
+    if allow:
+        bits.append("只许 " + "、".join(allow))
+    elif allow is not None:
+        bits.append("禁止调用任何工具")
+    return "；".join(bits)
+
+
+def tools_applied(echo, allow_tools):
+    """回显的白名单**是请求值的子集**才算这层闸真接住了（服务端只会更严，不会更松）。
+
+    和 `caps_applied` 同一条理由：话已经发出去了，字段被旧版聊天页安静地忽略，
+    那一刻"只读班"正拿着动作工具在跑。没请求白名单时回显无所谓。
+    """
+    if allow_tools is None:
+        return True
+    if not isinstance(echo, dict):
+        return False
+    got = echo.get("allow_tools")
+    if not isinstance(got, list):
+        return False
+    return set(str(x) for x in got) <= set(allow_tools)
+
+
 def preflight(task, chat, car, occ):
     """体检。字段名全部照 :8020/state 与 :8010/api/state 实测的那一套，不写代码里没读过的键。"""
     if chat is None:
@@ -260,16 +307,17 @@ def run_once(tasks, api, now, fired, dry=False, force=None):
             did.append((name, "blocked", why))
             continue
         if dry:
-            note = caps_note(task)
+            note = gate_note(task)
             log("%s [dry-run] 体检全过，本该发这句%s：%s" % (
-                name, "（单次上限 " + note + "）" if note else "", task["prompt"]), now)
+                name, "（" + note + "）" if note else "", task["prompt"]), now)
             did.append((name, "dry", []))
             continue
         turns0 = (chat or {}).get("turns", 0)
-        note = caps_note(task)
+        note = gate_note(task)
         log("%s 触发（体检全过%s）：%s" % (
-            name, "，单次上限 " + note if note else "", task["prompt"]), now)
-        err = api.post_chat(task["prompt"], task["max_distance"], task["max_angle"])
+            name, "，" + note if note else "", task["prompt"]), now)
+        err = api.post_chat(task["prompt"], task["max_distance"], task["max_angle"],
+                            task["allow_tools"])
         if err:
             log("%s 发不出去：%s" % (name, err), now)
             fired[name] = {"date": now.strftime("%Y-%m-%d"), "state": "blocked", "reasons": [err]}
@@ -283,7 +331,7 @@ def run_once(tasks, api, now, fired, dry=False, force=None):
             name, state, info.get("used_s", 0), info.get("turns"),
             "：「%s」" % text[:120] if text else ""), now)
         write_last({"name": name, "at": now.strftime("%Y-%m-%d %H:%M:%S"), "state": state,
-                    "caps": note, "info": info, "said": text, "prompt": task["prompt"]})
+                    "gates": note, "info": info, "said": text, "prompt": task["prompt"]})
         did.append((name, state, info))
     save_fired(fired)
     return did
@@ -374,7 +422,7 @@ class HttpApi(object):
                 return ev.get("text") or ""
         return ""
 
-    def post_chat(self, text, max_distance=None, max_angle=None):
+    def post_chat(self, text, max_distance=None, max_angle=None, allow_tools=None):
         # confirm=False：无人值守不该留一张没人点的确认卡 —— 60 s 后它自己超时变拒绝，
         # 那一轮就只会拿着一串拒绝结束。硬上限换由 max_minutes + 急停 + 服务端 clamp 三处兜。
         # 这两个可选数就是第三处的旋钮：任务自己把单次位移压小，但只在回显对上时才算数。
@@ -383,16 +431,21 @@ class HttpApi(object):
             body["max_distance"] = max_distance
         if max_angle is not None:
             body["max_angle"] = max_angle
+        if allow_tools is not None:
+            body["allow_tools"] = allow_tools
         err, echo = self._post(self.chat_url + "/chat", body)
         if err:
             return err
-        if not caps_applied(echo, max_distance, max_angle):
-            # 话已经发出去了，正拿全局上限跑着 —— 先掐停再解释，别等它跑完。
+        bad = [n for n, ok in (("单次上限", caps_applied(echo, max_distance, max_angle)),
+                               ("工具白名单", tools_applied(echo, allow_tools))) if not ok]
+        if bad:
+            # 话已经发出去了，正拿全局上限、全套 15 个工具跑着 —— 先掐停再解释，别等它跑完。
             self.post_stop()
-            return ("单次上限没生效（要 %s，:8020 回显 %s）：已发急停。"
-                    "多半是聊天页还在跑不认识这两个字段的旧版 car_chat.py，重启它" % (
-                        caps_note({"max_distance": max_distance, "max_angle": max_angle}) or "没要求",
-                        json.dumps(echo, ensure_ascii=False)[:120]))
+            want = gate_note({"max_distance": max_distance, "max_angle": max_angle,
+                              "allow_tools": allow_tools}) or "没要求"
+            return ("%s没生效（要 %s，:8020 回显 %s）：已发急停。"
+                    "多半是聊天页还在跑不认识这些字段的旧版 car_chat.py，重启它" % (
+                        "、".join(bad), want, json.dumps(echo, ensure_ascii=False)[:120]))
         return None
 
     def post_stop(self):
@@ -418,6 +471,7 @@ class FakeApi(object):
         self.left = None
         self.sent, self.stops, self.gets = [], 0, 0
         self.sent_caps = []              # 每次 post_chat 带的那对逐轮上限，供判据核对
+        self.sent_tools = []             # 每次 post_chat 带的那份工具白名单
 
     def chat_state(self):
         self.gets += 1
@@ -437,9 +491,9 @@ class FakeApi(object):
     def last_text(self):
         return self.text or ""
 
-    def post_chat(self, text, max_distance=None, max_angle=None):
+    def post_chat(self, text, max_distance=None, max_angle=None, allow_tools=None):
         self.sent.append(text)
-        self.sent_caps.append((max_distance, max_angle))
+        self.sent_caps.append((max_distance, max_angle, allow_tools))
         self.chat["busy"] = True
         self.left = self.busy_left
         return None
@@ -653,12 +707,12 @@ def self_test():
         ck("回显 %r 对要求 %s/%s -> %s" % (echo, d, a, want), caps_applied(echo, d, a), want)
     api, fired = FakeApi(chat={"busy": False, "turns": 0}), {}
     run_once([task(max_distance=0.8, max_angle=45)], api, T, fired, force="T")
-    ck("任务表里的数真的带上了这次 POST", api.sent_caps, [(0.8, 45)])
+    ck("任务表里的数真的带上了这次 POST", api.sent_caps, [(0.8, 45, None)])
     txt = open(os.path.join(PATHS["dir"], "_cron.log"), encoding="utf-8").read()
     ck("  触发那行日志带上上限（不然事后只看日志，不知道这班是压着跑的）", "0.80 米、45 度" in txt, True)
-    ck("  _cron_last.json 也留一笔 caps",
-       json.load(open(os.path.join(PATHS["dir"], "_cron_last.json"), encoding="utf-8"))["caps"],
-       "0.80 米、45 度")
+    ck("  _cron_last.json 也留一笔 gates",
+       json.load(open(os.path.join(PATHS["dir"], "_cron_last.json"), encoding="utf-8"))["gates"],
+       "单次上限 0.80 米、45 度")
     api = FakeApi(chat={"busy": False, "turns": 0})
     api.post_chat = lambda *a: "单次上限没生效（要 0.80 米，:8020 回显 {}）：已发急停"
     ck("  上限没生效 = 这班算发失败，记 blocked、不进等跑完的循环",
@@ -667,7 +721,8 @@ def self_test():
     with open(os.path.join(HERE, "car_chat.py"), encoding="utf-8") as fh:
         chat_src = fh.read()
     ck("服务端回显的字段名和这边读的是同一对（两边各写各的，早晚会漂）",
-       ['"max_distance": dist' in chat_src, '"max_angle": ang' in chat_src], [True, True])
+       ['"max_distance": dist' in chat_src, '"max_angle": ang' in chat_src,
+        '"allow_tools": tools' in chat_src], [True, True, True])
 
     # 12 "回显对不上就当场急停"只能在真 HTTP 上证：假 api 里这条分支根本不会被走到。
     import http.server
@@ -715,8 +770,63 @@ def self_test():
         ck("没要求上限时不看回显（老任务表一个字都不必改，行为和以前一样）",
            [api.post_chat("去巡游"), hits["body"]],
            [None, {"text": "去巡游", "confirm": False}])
+        # 白名单走同一条回显规矩：旧版聊天页同样是安静地忽略，而那班车什么都调得动。
+        MockChat.echo = {"ok": True, "max_distance": 1.5, "max_angle": 90.0,
+                         "allow_tools": ["MapInfo", "GetStatus"]}
+        ck("白名单对上回显：正常返回，一发急停都不补",
+           [api.post_chat("只读汇报", None, None, ["MapInfo", "GetStatus"]), hits["stop"]], [None, 2])
+        ck("  白名单也是走字段，不进那句话", hits["body"],
+           {"text": "只读汇报", "confirm": False, "allow_tools": ["MapInfo", "GetStatus"]})
+        MockChat.echo = {"ok": True}          # 旧版：不认识 allow_tools
+        err = api.post_chat("只读汇报", None, None, ["MapInfo"])
+        ck("回显没有 allow_tools = 这班其实什么都调得动：立刻急停",
+           [hits["stop"], "工具白名单没生效" in err], [3, True])
+        MockChat.echo = {"ok": True, "allow_tools": ["MapInfo", "Tour"]}
+        ck("  回显比请求宽（服务端还多放了一个 Tour）同样判没生效",
+           [api.post_chat("只读汇报", None, None, ["MapInfo"]) is not None, hits["stop"]], [True, 4])
     finally:
         srv.shutdown()
+
+    # 13 工具白名单这层闸本身：上限管的是"这一步别走太远"，白名单管的才是"这班根本不该动车"。
+    ck("任务表没写 allow_tools 就是不限制（老表一个字不改，行为和以前一字不差）",
+       task()["allow_tools"], None)
+    for bad_v, tag in (("MapInfo", "写成字符串"), ({"a": 1}, "写成对象"), ([1, 2], "列表里不是名字")):
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({"tasks": [{"name": "甲", "at": "07:00", "prompt": "x",
+                                  "allow_tools": bad_v}]}, fh, ensure_ascii=False)
+        ck("  %s：当场报错，不许当没写" % tag, "allow_tools" in (load_tasks(p)[1] or ""), True)
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump({"tasks": [{"name": "甲", "at": "07:00", "prompt": "x",
+                              "allow_tools": ["MapInfo", " MapInfo ", "GetStatus"]}]}, fh, ensure_ascii=False)
+    ck("  重复与空格在加载时就收干净（回显比对用的是同一份规范化结果）",
+       load_tasks(p)[0][0]["allow_tools"], ["MapInfo", "GetStatus"])
+    ck("gate_note 把两样闸拼成人话，没写的部分不多嘴",
+       [gate_note(task()), gate_note(task(max_distance=0.8)),
+        gate_note(task(allow_tools=["MapInfo", "GetStatus"])),
+        gate_note(task(max_distance=0.8, allow_tools=[]))],
+       ["", "单次上限 0.80 米", "只许 MapInfo、GetStatus", "单次上限 0.80 米；禁止调用任何工具"])
+    for echo, want_list, want in (({"allow_tools": ["MapInfo"]}, ["MapInfo"], True),
+                                  ({"allow_tools": []}, ["MapInfo"], True),
+                                  ({"allow_tools": ["MapInfo", "Tour"]}, ["MapInfo"], False),
+                                  ({"allow_tools": []}, [], True),
+                                  ({}, ["MapInfo"], False),
+                                  ({"allow_tools": "MapInfo"}, ["MapInfo"], False),
+                                  (None, ["MapInfo"], False),
+                                  ({}, None, True)):
+        ck("白名单回显 %r 对要求 %s -> %s" % (echo, want_list, want),
+           tools_applied(echo, want_list), want)
+    api = FakeApi(chat={"busy": False, "turns": 0})
+    run_once([task(allow_tools=["MapInfo"])], api, T, {}, force="T")
+    ck("任务表里的名单真的带上了这次 POST", api.sent_caps, [(None, None, ["MapInfo"])])
+    txt = open(os.path.join(PATHS["dir"], "_cron.log"), encoding="utf-8").read()
+    ck("  日志与 _cron_last.json 都写得出这班戴着哪层闸",
+       ["只许 MapInfo" in txt,
+        json.load(open(os.path.join(PATHS["dir"], "_cron_last.json"), encoding="utf-8"))["gates"]],
+       [True, "只许 MapInfo"])
+    api = FakeApi(chat={"busy": False, "turns": 0})
+    api.post_chat = lambda *a: "工具白名单没生效（要 只许 MapInfo，:8020 回显 {}）：已发急停"
+    ck("  白名单没生效 = 这班算发失败，记 blocked、不进等跑完的循环",
+       run_once([task(allow_tools=["MapInfo"])], api, T, {}, force="T")[0][1], "post_failed")
 
     print("\n%s" % ("SELF-TEST PASS" if not fails else "SELF-TEST FAIL：%s" % fails))
     return 1 if fails else 0

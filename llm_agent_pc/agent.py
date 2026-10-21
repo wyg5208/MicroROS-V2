@@ -27,6 +27,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 RISKY_TOOLS = {"Move", "TargetTrack", "FollowLine", "Navigation"}
+# 白名单里永远放着 Stop：拦掉它拦不住任何动作，只会让模型自己想收手都收不了。
+# 人那一侧的急停走的是 :8020/stop 与 :8010，不经过这里，本来就不受白名单管辖。
+ALWAYS_ALLOWED = {"Stop"}
 ID_GEN = itertools.count(1)
 
 
@@ -279,6 +282,21 @@ def describe_image(cfg, image_path):
     return openai_chat(cfg, msgs, model=cfg.vision_model).get("content") or ""
 
 
+def tool_gate(cfg, name):
+    """逐轮工具白名单：这一轮只许用列出来的那几个工具，其余当场拦下、**不发往车**。
+
+    返回拒绝文本，空字符串表示放行。`clamp_motion` 管的是"这一步别走太远"，管不住
+    "这一班根本不该动车"：只读汇报那种任务要的是任何动作工具都不发生，而不是每个都少做一点。
+    白名单是 None 时行为与从前一字不差（命令行、网页手动一句话都不受影响）。
+    """
+    allow = getattr(cfg, "allow_tools", None)
+    if allow is None or name in allow or name in ALWAYS_ALLOWED:
+        return ""
+    return ("[本轮工具白名单里没有 %s（只允许：%s）。这个工具**没有执行**，车上什么都没发生；"
+            "请用白名单里的工具完成指令，或者直接告诉用户你需要放开哪一个，不要换个动作工具硬来]" % (
+                name, "、".join(sorted(allow))))
+
+
 def clamp_motion(cfg, name, args):
     """硬上限：小模型给出夸张参数时截断，避免车跑飞。
 
@@ -318,6 +336,8 @@ class ConsoleHooks:
             print("      结果: " + ev["text"].replace("\n", " ")[:200])
         elif kind == "badargs":
             print(f"  [{ev['step']}] {ev['tool']} -> {ev['text']}")
+        elif kind == "blocked":
+            print(f"  [{ev['step']}] {ev['tool']} 被本轮工具白名单拦下（没有下发给车）")
         elif kind == "limit":
             print("\n[已达到单轮最大工具调用次数，等待用户新指令]")
 
@@ -389,6 +409,12 @@ def run_turn(cfg, mcp, tools_spec, name_map, messages, user_text):
                 hooks.event({"type": "badargs", "step": step + 1, "tool": real, "text": result})
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
                 break
+            blocked = tool_gate(cfg, real)
+            if blocked:
+                # 不发往车，也**不发 call 事件**：页面上那张"调用 Move"的卡片会让人以为动作开始了
+                hooks.event({"type": "blocked", "step": step + 1, "tool": real, "text": blocked})
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": blocked})
+                continue
             args, clamped = clamp_motion(cfg, real, args)
             hooks.event({"type": "call", "step": step + 1, "tool": real, "args": args})
             secs = 0.0
@@ -449,6 +475,8 @@ def build_argparser():
     p.add_argument("--max-steps", type=int, default=10)
     p.add_argument("--max-distance", type=float, default=1.0, help="单次 Move 最大位移(米)")
     p.add_argument("--max-angle", type=float, default=360.0, help="单次 Move 最大转角(度)")
+    p.add_argument("--allow-tools", nargs="+", metavar="TOOL", default=None,
+                   help="本轮只允许这几个 MCP 工具名，其余当场拦下不下发给车；不填=不限")
     p.add_argument("--temperature", type=float, default=0.3)
     p.add_argument("--llm-timeout", type=float, default=300.0)
     p.add_argument("--mcp-timeout", type=float, default=180.0)
@@ -560,7 +588,12 @@ def self_test(cfg):
         ]:
             hit = IMAGE_RE.search(text)
             assert hit and hit.group(1) == want, "图像路径解析失败: %r -> %r" % (text, hit)
-        print("\n[self-test] PASS：MCP 握手/SSE 解析/工具调用回环/图像路径(含 Windows) 均正常")
+        cfg.allow_tools = ["MapInfo"]
+        for name, refused in (("MapInfo", False), ("Stop", False), ("Move", True), ("Tour", True)):
+            assert bool(tool_gate(cfg, name)) is refused, "白名单拦错：%s -> %r" % (name, tool_gate(cfg, name))
+        cfg.allow_tools = None
+        assert not tool_gate(cfg, "Tour"), "没设白名单时不该拦任何工具"
+        print("\n[self-test] PASS：MCP 握手/SSE 解析/工具调用回环/图像路径(含 Windows)/工具白名单 均正常")
         return 0
     except Exception as exc:
         print(f"\n[self-test] FAIL: {type(exc).__name__}: {exc}")

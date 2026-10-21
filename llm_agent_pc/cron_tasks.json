@@ -33,7 +33,11 @@
    "prompt": "只用 MapInfo 和 GetStatus 汇报：还剩多少未测格、电池多少伏、记住过哪些地点。不要动车",
    "enabled": false,
    "max_distance": 0.0,
-   "max_angle": 0.0
+   "max_angle": 0.0,
+   "allow_tools": [
+    "MapInfo",
+    "GetStatus"
+   ]
   }
  ]
 }
