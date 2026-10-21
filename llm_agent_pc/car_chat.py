@@ -715,6 +715,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/state":
             return self._send(200, {"chat": {"busy": s.busy, "turns": s.turns,
                                               "gates": s.gates,
+                                              # gates 空闲时留着的是**上一轮**那三样（挂在那儿给 `_cron` 与页面核对），
+                                              # caps 才是启动那对天花板。页面必须分开显示：把上一轮的"本轮上限 0 米"
+                                              # 当成天花板，人就会以为下一句也被锁在 0 米。
+                                              "caps": list(s.caps),
                                               "pending": [s._approval_payload(r, a)
                                                           for r, a in s.pending.items()]},
                                     "voice": {"asr": self.asr.info(), "tts": self.speaker.info()},

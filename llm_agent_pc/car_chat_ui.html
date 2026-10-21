@@ -47,6 +47,11 @@ canvas,img{background:#0b0d10;border:1px solid var(--ed);border-radius:6px;displ
 .bar i{display:block;height:100%;background:#7a5c1f;border-radius:2px}
 textarea{width:100%;background:#0f1216;color:var(--fg);border:1px solid var(--ed);
          border-radius:6px;padding:8px;font:inherit;resize:vertical;min-height:52px}
+input.num,select,input.txt{background:#0f1216;color:var(--fg);border:1px solid var(--ed);
+         border-radius:5px;padding:3px 5px;font:inherit}
+input.num{width:62px}
+.gate{background:#12202a;border:1px solid #24405a;border-radius:6px;padding:6px 8px;margin-top:6px}
+.gate.on{background:#241315;border-color:#5a2b2b}
 .spread{justify-content:space-between}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--dim);
      margin-right:5px;vertical-align:1px}
@@ -100,6 +105,23 @@ textarea{width:100%;background:#0f1216;color:var(--fg);border:1px solid var(--ed
     <div id=approvals></div>
     <div style="margin-top:8px">
       <textarea id=text placeholder="例如：前进 0.2 米，然后看看前面有什么，最后报一下你在地图哪里。（Enter 发送，Shift+Enter 换行）"></textarea>
+      <div class="gate" id=gateBox>
+        <div class="row">
+          <span class="hint" title="只给**发出去的这一句**上闸，发完就失效；留空=这一句不限">本轮上闸</span>
+          <label class=hint>位移 ≤ <input class=num id=capDist placeholder="不限"></label>
+          <label class=hint>转角 ≤ <input class=num id=capAng placeholder="不限"></label>
+          <select id=gatePreset title="工具白名单：不在表里的工具当场拦下，连「发给车」这一步都没有">
+            <option value="">工具不限</option>
+            <option value="MapInfo,GetStatus">只许读图况（MapInfo、GetStatus）</option>
+            <option value="__none">什么都不许调</option>
+            <option value="__custom">自己填工具名…</option>
+          </select>
+          <input class=txt id=capTools size=22 placeholder="逗号分隔，如 MapInfo,GetStatus" hidden>
+          <span class="hint" id=gateNow></span>
+        </div>
+        <div class="hint" id=gateHelp>上限只压 <b>Move</b> 的距离和角度；想"这一句根本不许动车"要挑工具白名单。
+          <b>Stop</b> 永远放行，你的急停按钮更不经过这道闸。</div>
+      </div>
       <div class="row spread" style="margin-top:6px">
         <span class=hint id=status></span>
         <span>
@@ -254,20 +276,98 @@ function post(path, body){
       catch (e) { return {ok: r.ok, status: r.status, error: t}; } });
 }
 
+function gateNum(id){
+  // 返回 [值, 错误文本]。输入框交出来的是字符串，服务端只认 JSON 里的**真数**
+  // （它拒绝"写了但不是数"被当成没写，见 car_chat.py 的 _num），所以这里必须转成数字再发。
+  const raw = $(id).value.trim();
+  if (raw === "") return [null, ""];
+  const v = Number(raw);
+  if (!isFinite(v) || v < 0) return [null, "「" + raw + "」不是不小于 0 的数字"];
+  return [v, ""];
+}
+
+function gateBody(){
+  // 留空就**整个字段不发**：发 "" 过去服务端会当"你要一个不是数字的上限"当场 400。
+  // 填了却不像是数 = 这一句宁可不发：把"我以为上了闸"的话当"没上闸"发出去是最危险的方向。
+  const d = gateNum("capDist"), a = gateNum("capAng");
+  if (d[1] !== "" || a[1] !== "") {
+    const why = [];
+    if (d[1] !== "") why.push("位移上限" + d[1]);
+    if (a[1] !== "") why.push("转角上限" + a[1]);
+    note("这一句没发出去：" + why.join("、") + "。留空才等于不上这个闸。");
+    return null;
+  }
+  const b = {};
+  if (d[0] !== null) b.max_distance = d[0];
+  if (a[0] !== null) b.max_angle = a[0];
+  const tools = gateTools();
+  if (tools !== null) b.allow_tools = tools;
+  return b;
+}
+
 function send(){
   const text = $("text").value.trim();
   if (!text || busy) return;
-  post("/chat", {text, confirm: $("needConfirm").checked}).then(r => {
+  const gates = gateBody();
+  if (gates === null) return;
+  const body = Object.assign({text, confirm: $("needConfirm").checked}, gates);
+  post("/chat", body).then(r => {
     if (!r.ok) { note("没发出去（" + r.status + "）：" + (r.error || "")); return; }
     $("text").value = "";
+    // 生效的是服务端回显的那一份，不是我以为发出去的那一份（它可以更严，不能更松）
+    note("这一句的闸已生效：" + pretty({max_distance: r.max_distance, max_angle: r.max_angle,
+                                        allow_tools: r.allow_tools}) +
+         "（跑偏了可以在 :8020/state 的 chat.gates 核对）");
   }).catch(e => note("发送失败：" + e));
 }
 $("send").onclick = send;
+
+// ---- 本轮上闸：只对**发出去的那一句**生效，下一句回到天花板（start_turn 每轮重算）----
+const GATE_KEY = "carChatGates";
+
+function gateTools(){
+  // 返回 null = 这一句不限工具；返回 [] = 什么都不许调。这两个语义不许混（同 max_distance=0 那条规矩）。
+  const v = $("gatePreset").value;
+  if (v === "") return null;
+  if (v === "__none") return [];
+  if (v === "__custom") return $("capTools").value.split(",").map(s => s.trim()).filter(s => s);
+  return v.split(",");
+}
+
+function gateText(){
+  const bits = [];
+  const d = $("capDist").value.trim(), a = $("capAng").value.trim();
+  if (d !== "" || a !== "") bits.push("上限 " + (d === "" ? "不限" : d + " 米") + " / " + (a === "" ? "不限" : a + " 度"));
+  const t = gateTools();
+  if (t === null) return bits.length ? bits.join("；") : "";
+  bits.push(t.length ? "只许 " + t.join("、") : "什么都不许调");
+  return bits.join("；");
+}
+
+function paintGate(){
+  const t = gateText();
+  const on = t !== "";
+  $("gateBox").className = "gate" + (on ? " on" : "");
+  $("gateNow").textContent = on ? "这一句会带上：" + t : "没上闸（发出去就按服务端天花板跑）";
+  $("capTools").hidden = $("gatePreset").value !== "__custom";
+  localStorage.setItem(GATE_KEY, JSON.stringify({d: $("capDist").value, a: $("capAng").value,
+                                                 p: $("gatePreset").value, t: $("capTools").value}));
+}
+
+try {
+  const g = JSON.parse(localStorage.getItem(GATE_KEY) || "{}");
+  $("capDist").value = g.d || ""; $("capAng").value = g.a || "";
+  $("gatePreset").value = g.p || ""; $("capTools").value = g.t || "";
+} catch (e) { /* 存坏了就当没上闸，别把页面卡死 */ }
+["capDist", "capAng", "capTools"].forEach(id => $(id).addEventListener("input", paintGate));
+$("gatePreset").onchange = paintGate;
+paintGate();
+
 $("needConfirm").checked = localStorage.getItem("carChatConfirm") === "1";
 $("needConfirm").addEventListener("change", e => {
   localStorage.setItem("carChatConfirm", e.target.checked ? "1" : "0");
   note(e.target.checked ? "已开启确认：每个动作都会先弹卡片等你点允许。"
-                        : "已关闭确认：动作直接执行，靠急停按钮和 0.5 m / 90° 上限兜底。");
+                        : "已关闭确认：动作直接执行，靠急停按钮和服务端那对上限兜底（现值看侧栏「闸」那一行）。");
 });
 $("text").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
@@ -384,6 +484,17 @@ $("speak").addEventListener("change", e => {
 
 // ---- 状态轮询 ----
 const fmt = (v, n = 2) => (typeof v === "number" ? +v.toFixed(n) : (v === undefined || v === null ? "—" : v));
+function gateRow(chat){
+  // gates 空闲时留着的是上一轮那三样，caps 才是天花板 —— 混在一起显示会让人以为下一句也被锁着。
+  const g = chat.gates || {}, cap = chat.caps || [];
+  const n = (v, unit) => (v === undefined || v === null ? "不限" : v + " " + unit);
+  let line = "上限 " + n(g.max_distance, "米") + " / " + n(g.max_angle, "度") +
+             "（天花板 " + (cap.length ? cap.join(" / ") : "—") + "）";
+  line += g.allow_tools === undefined || g.allow_tools === null ? " · 工具不限"
+          : (g.allow_tools.length ? " · 只许 " + g.allow_tools.join("、") : " · 什么都不许调");
+  return line;
+}
+
 function renderStat(c, chat, v){
   const s = $("stat"); s.textContent = "";
   const asr = (v && v.asr) || {}, tts = (v && v.tts) || {};
@@ -399,6 +510,7 @@ function renderStat(c, chat, v){
              (tts.ready ? " / 朗读 " + tts.voice : " / 无朗读") +
              (tts.last && tts.last.indexOf("没出声") >= 0 ? "（" + tts.last + "）" : "")],
     ["这一页", chat.busy ? "回合执行中" : "空闲"],
+    ["闸（本轮）", gateRow(chat)],
   ];
   rows.forEach(([k, val]) => { s.appendChild(el("b", null, k)); s.appendChild(el("span", null, val)); });
   const up = !!c.online;
